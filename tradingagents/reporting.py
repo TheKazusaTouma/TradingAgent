@@ -89,13 +89,81 @@ def _report_parts(final_state: dict) -> list[tuple[str, str, list[tuple[str, str
     return parts
 
 
+def contract_validation_block(records: dict | None) -> str:
+    """The English ``## Contract Validation`` summary of an enhanced run, or ``""``.
+
+    Payload-free by construction: it lists each agent's outcome, stage, issue codes and the
+    call accounting, never model text (FR-6). It returns an empty string when there are no
+    records, which is every ``off``-mode run, so the baseline report is unchanged.
+    """
+    if not records:
+        return ""
+    from tradingagents.agents.contracts import contract_summary_lines
+
+    lines = contract_summary_lines(records)
+    if not lines:
+        return ""
+    return "## Contract Validation\n\n" + "\n".join(lines)
+
+
+def write_failed_run_audit(root, ticker: str, trade_date, error, records: dict | None = None) -> Path:
+    """Write a failed run's audit next to the reports, clearly labelled as a failure.
+
+    Kept separate from ``write_report_tree`` on purpose: a failed run must never appear as
+    a report and must never replace an earlier successful one (ADR-001 section 2.9, T-30).
+    """
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"contract_validation_failed_{safe_component(ticker)}_{trade_date}.md"
+    lines = [
+        f"# Contract Validation Failure: {ticker} on {trade_date}",
+        "",
+        "This run stopped before producing a decision. This file is an audit of the",
+        "failure, not a report of a result.",
+        "",
+        f"- Outcome: failed ({_kind(error)})",
+        f"- Stage: {_stage(error)}",
+        f"- Agent: {_agent(error)}",
+    ]
+    issues = getattr(error, "issues", None) or []
+    if issues:
+        lines.append("- Issues: " + ", ".join(f"{i.field}:{i.code}" for i in issues))
+    from tradingagents.agents.contracts import contract_summary_lines
+
+    summary = contract_summary_lines(records)
+    if summary:
+        lines.extend(["", "## Contract Validation", "", *summary])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _kind(error):
+    return getattr(getattr(error, "kind", None), "value", "validation")
+
+
+def _stage(error):
+    return getattr(getattr(error, "stage", None), "value", "unknown")
+
+
+def _agent(error):
+    return getattr(error, "agent", "unknown")
+
+
+def safe_component(ticker: str) -> str:
+    """A ticker made safe to use inside a filename."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(ticker)) or "unknown"
+
+
 def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict | None = None,
-                      html: bool = True) -> Path:
+                      html: bool = True, contract_records: dict | None = None) -> Path:
     """Save a completed run's reports to ``save_path``; return the complete-report path.
 
     ``settings`` (``TradingAgentsGraph.run_settings()``) adds what produced the run
     to the report's header. ``html`` also writes ``complete_report.html``, one
     self-contained page of the same report (#1419).
+    ``contract_records`` are an enhanced-mode run's per-agent validation records; when
+    present they add a ``## Contract Validation`` summary. With no records -- every
+    ``off``-mode run -- the report is byte-for-byte the baseline report (INV-7).
     Reusing a directory replaces the generated report files, removing sections
     absent from this run and disabled HTML. Other files and directories are kept.
     """
@@ -109,6 +177,10 @@ def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict 
             (save_path / folder / filename).write_text(text, encoding="utf-8")
         content = "\n\n".join(f"### {agent}\n{text}" for agent, _filename, text in written)
         sections.append(f"## {heading}\n\n{content}")
+
+    contract_block = contract_validation_block(contract_records)
+    if contract_block:
+        sections.append(contract_block)
 
     (save_path / "complete_report.md").write_text(
         _header(ticker, final_state, settings) + "\n\n".join(sections), encoding="utf-8"
