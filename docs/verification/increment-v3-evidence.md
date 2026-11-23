@@ -69,3 +69,14 @@ The initial hosted run failed during collection because the new schema tests imp
 test assertions and CI workflow are unchanged. The local environment already contained
 this test tool, which is why the original offline run did not expose the packaging defect.
 The hosted checks are rerun after this correction; their current status is shown on PR #4.
+
+## Python URL-parser compatibility correction
+
+After dependency collection was fixed, hosted Python versions rejected a malformed IPv6
+authority earlier than the local parser, producing a generic diagnostic. The input was
+already rejected, but three existing tests required the actionable port diagnostic.
+OpenCode unified the specific bracket-suffix diagnosis on both parser paths, preserved
+credential redaction and all original assertions, and added four strict-parser regression
+cases. Focused configuration tests: 90 passed; Ruff passed. The full hosted matrix runs
+on the resulting commit; the earlier full local suite above is a historical result, not
+a claim that it was rerun after this source correction.

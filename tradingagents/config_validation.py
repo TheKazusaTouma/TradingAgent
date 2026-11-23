@@ -257,6 +257,52 @@ def _check_provider(problems, config, key):
     return name
 
 
+def _url_authority(text: str) -> str | None:
+    """The ``userinfo@host:port`` authority of an absolute URL, or ``None`` if it has none.
+
+    A deterministic split of ``scheme://authority/...``. It only locates the structure
+    ``urlsplit`` failed on; no component is normalised or validated here.
+    """
+    scheme, sep, rest = text.partition("://")
+    if not sep or not scheme or "/" in scheme or "?" in scheme or "#" in scheme:
+        return None
+    end = len(rest)
+    for delimiter in "/?#":
+        found = rest.find(delimiter)
+        if found >= 0:
+            end = min(end, found)
+    return rest[:end]
+
+
+# The one diagnostic for a bracketed host followed by stray data. It is a constant on purpose:
+# the suffix itself is never echoed, so a credential cannot leak through it, and the wording
+# does not depend on which ``urlsplit`` (permissive or strict) examined the value.
+_BRACKET_SUFFIX_DETAIL = (
+    "a bracketed host must be followed by a port ('[host]:port') or end the authority"
+)
+
+
+def _has_bracket_suffix(text: str) -> bool:
+    """Whether a bracketed host is followed by a non-colon, non-empty suffix.
+
+    ``[::1]extra`` has one; ``[::1]``, ``[::1]:11434`` and ``[::1]:`` do not. The numeric port
+    is not examined here -- the ``.port`` read below reports that. Whether ``urlsplit`` itself
+    rejects such an authority varies by interpreter (CPython ``_check_bracketed_netloc`` raises
+    ``Invalid IPv6 URL``; older code accepts it), so the rule is applied here directly.
+    """
+    authority = _url_authority(text)
+    if authority is None:
+        return False
+    host_port = authority.rpartition("@")[2]
+    _, bracket, bracketed = host_port.partition("[")
+    if not bracket:
+        return False
+    if "]" not in bracketed:
+        return True  # unterminated bracket: no valid port can follow it
+    suffix = bracketed.split("]", 1)[1]
+    return bool(suffix) and not suffix.startswith(":")
+
+
 def _check_backend_url(problems, config, key):
     """``None``/blank, or an ``http``/``https`` URL with a host, no whitespace and no userinfo."""
     if key not in config:
@@ -278,6 +324,21 @@ def _check_backend_url(problems, config, key):
     try:
         parts = urlsplit(text)
     except ValueError:
+        # A strict ``urlsplit`` (CPython ``_check_bracketed_netloc``) raises here for a
+        # bracketed host with a trailing suffix, before ``.port`` can be read; older parsers
+        # accept it and reach the explicit check below. Diagnose it here the same way, so the
+        # report does not depend on which parser runs.
+        authority = _url_authority(text)
+        if authority is not None and "@" in authority:
+            problems.append(ConfigProblem(
+                key, "invalid_url", f"a URL must not embed credentials: {_REDACTED}"
+            ))
+            return None
+        if _has_bracket_suffix(text):
+            problems.append(ConfigProblem(
+                key, "invalid_url", f"{_BRACKET_SUFFIX_DETAIL}: {_describe(text)}"
+            ))
+            return None
         problems.append(ConfigProblem(
             key, "invalid_url", f"could not be parsed as a URL: {_describe(text)}"
         ))
@@ -309,14 +370,11 @@ def _check_backend_url(problems, config, key):
             key, "invalid_url", f"a URL port after ':' is empty: {_describe(text)}"
         ))
         return None
-    if "]" in authority and not authority.split("]", 1)[1].startswith(":"):
-        suffix = authority.split("]", 1)[1]
-        if suffix:
-            problems.append(ConfigProblem(
-                key, "invalid_url",
-                f"a bracketed host must be followed by a port ('host:port') or end: {_describe(text)}",
-            ))
-            return None
+    if _has_bracket_suffix(text):
+        problems.append(ConfigProblem(
+            key, "invalid_url", f"{_BRACKET_SUFFIX_DETAIL}: {_describe(text)}"
+        ))
+        return None
     try:
         port = parts.port
     except ValueError:

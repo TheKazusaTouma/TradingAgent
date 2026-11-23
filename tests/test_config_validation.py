@@ -485,6 +485,49 @@ def test_pf13_good_ports_are_accepted_for_every_url_key(key):
         assert validate_config({key: url}) == [], url
 
 
+# Some ``urlsplit`` versions reject a bracket host with trailing data while splitting
+# (``ValueError: Invalid IPv6 URL``), before ``.port`` is ever read; others accept it and rely
+# on the explicit bracket-suffix check. Either way the caller must get the same actionable
+# port report. The patch below simulates the strict parser for this value only.
+@pytest.mark.parametrize("key", ["backend_url", "deep_think_backend_url", "quick_think_backend_url"])
+def test_pf13_a_strict_urlsplit_still_names_the_malformed_bracket_suffix(key, monkeypatch):
+    import tradingagents.config_validation as config_validation
+
+    real_urlsplit = config_validation.urlsplit
+
+    def strict_urlsplit(url, *args, **kwargs):
+        if url == "http://[::1]extra/v1":
+            raise ValueError("Invalid IPv6 URL")
+        return real_urlsplit(url, *args, **kwargs)
+
+    monkeypatch.setattr(config_validation, "urlsplit", strict_urlsplit)
+    problems = validate_config({key: "http://[::1]extra/v1"})
+    assert [p.parameter for p in problems] == [key]
+    assert problems[0].code == "invalid_url"
+    assert "port" in problems[0].detail.lower()
+    # The strict path and the permissive path report the same thing.
+    monkeypatch.setattr(config_validation, "urlsplit", real_urlsplit)
+    assert validate_config({key: "http://[::1]extra/v1"}) == problems
+
+
+def test_pf13_a_strict_urlsplit_report_never_echoes_a_secret(monkeypatch):
+    import tradingagents.config_validation as config_validation
+
+    def strict_urlsplit(url, *args, **kwargs):
+        raise ValueError("Invalid IPv6 URL")
+
+    monkeypatch.setattr(config_validation, "urlsplit", strict_urlsplit)
+    problems = validate_config(
+        {"backend_url": "http://user:sk-live-abcdef123456@[::1]extra/v1"}
+    )
+    text = str(problems[0])
+    # A credential-bearing URL keeps the established credential diagnostic on both parsers.
+    assert problems[0].code == "invalid_url"
+    assert "must not embed credentials" in text
+    assert "sk-live-abcdef123456" not in text and "user:" not in text
+    assert "<redacted>" in text
+
+
 def test_pf13_a_bad_port_fails_before_any_client_or_directory(tmp_path, monkeypatch):
     config = _valid_config(tmp_path) | {"backend_url": "http://localhost:notaport/v1"}
     clients = _spy_clients(monkeypatch)
