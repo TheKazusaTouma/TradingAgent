@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 from typing import Annotated
 
@@ -9,16 +10,28 @@ from stockstats import wrap
 
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
+from tradingagents.dataflows.vendors.yahoo.cache import _RangeCache, range_cache_key
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
 
 logger = logging.getLogger(__name__)
+
+# One process-local cache for date-range downloads. Raw frames are keyed by the
+# normalized request identity so a repeated query within the TTL reuses one
+# provider load; a failed load is never stored.
+_range_cache = _RangeCache()
+
+
+def _now() -> float:
+    """Monotonic clock for cache freshness (patched by tests with a fake clock)."""
+    return time.monotonic()
 
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    refresh: bool = False,
 ):
 
     datetime.strptime(start_date, "%Y-%m-%d")
@@ -31,13 +44,26 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
 
-    # Empty result means the symbol is unknown/delisted. Raise a typed error
-    # instead of returning prose: the routing layer turns it into a single
-    # unambiguous "no data" signal so the agent never fabricates a price.
-    if data is None or data.empty:
-        raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+    # Reuse a raw download for an identical request within its TTL. ``refresh``
+    # bypasses the old entry and a successful load re-populates it.
+    key = range_cache_key(canonical, "yahoo", "ohlcv", start_date, end_inclusive)
+    now = _now()
+    data = None if refresh else _range_cache.get(key, now)
+
+    if data is None:
+        data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
+
+        # Empty result means the symbol is unknown/delisted. Raise a typed error
+        # instead of returning prose: the routing layer turns it into a single
+        # unambiguous "no data" signal so the agent never fabricates a price.
+        if data is None or data.empty:
+            raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+
+        # Store only after the load succeeded; cache.store keeps its own copy.
+        _range_cache.store(key, data, _now())
+    # On a hit ``cache.get`` already returned this caller an independent copy.
+    # Either way ``data`` is safe to format in place below.
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:
