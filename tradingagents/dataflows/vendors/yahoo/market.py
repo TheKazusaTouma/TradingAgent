@@ -10,7 +10,7 @@ from stockstats import wrap
 
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
-from tradingagents.dataflows.vendors.yahoo.cache import _RangeCache, range_cache_key
+from tradingagents.dataflows.vendors.yahoo.cache import _Inflight, _RangeCache, range_cache_key
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
 
@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # normalized request identity so a repeated query within the TTL reuses one
 # provider load; a failed load is never stored.
 _range_cache = _RangeCache()
+
+# Concurrent identical misses share one provider load instead of each issuing
+# their own download.
+_range_inflight = _Inflight()
 
 
 def _now() -> float:
@@ -52,18 +56,31 @@ def get_YFin_data_online(
     data = None if refresh else _range_cache.get(key, now)
 
     if data is None:
-        data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
+        # Coalesce concurrent identical misses into one provider load. The
+        # loader rechecks the cache first, so a request that loses the race but
+        # arrives after another already stored the frame is served from it.
+        def _load() -> pd.DataFrame:
+            cached = None if refresh else _range_cache.get(key, _now())
+            if cached is not None:
+                return cached
+            loaded = yf_retry(
+                lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive)
+            )
 
-        # Empty result means the symbol is unknown/delisted. Raise a typed error
-        # instead of returning prose: the routing layer turns it into a single
-        # unambiguous "no data" signal so the agent never fabricates a price.
-        if data is None or data.empty:
-            raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+            # Empty result means the symbol is unknown/delisted. Raise a typed
+            # error instead of returning prose: the routing layer turns it into a
+            # single unambiguous "no data" signal so the agent never fabricates a
+            # price.
+            if loaded is None or loaded.empty:
+                raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
 
-        # Store only after the load succeeded; cache.store keeps its own copy.
-        _range_cache.store(key, data, _now())
-    # On a hit ``cache.get`` already returned this caller an independent copy.
-    # Either way ``data`` is safe to format in place below.
+            # Store only after the load succeeded; cache.store keeps its own copy.
+            _range_cache.store(key, loaded, _now())
+            return loaded
+
+        data = _range_inflight.run(key, _load)
+    # On a hit (cache or shared in-flight) this caller holds an independent copy,
+    # so ``data`` is safe to format in place below.
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:
