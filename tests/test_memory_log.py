@@ -36,6 +36,21 @@ def make_log(tmp_path, filename="trading_memory.md"):
     return TradingMemoryLog(config)
 
 
+def make_budget_log(tmp_path, budget, filename="trading_memory.md"):
+    config = {
+        "memory_log_path": str(tmp_path / filename),
+        "memory_context_max_chars": budget,
+    }
+    return TradingMemoryLog(config)
+
+
+def settle_entry(log, ticker, date, decision, reflection, resolution_date, rating="Buy"):
+    log.store_decision(ticker, date, decision, rating=rating)
+    log.update_with_outcome(
+        ticker, date, 0.05, 0.02, 5, reflection, resolution_date=resolution_date,
+    )
+
+
 def _seed_completed(tmp_path, ticker, date, decision_text, reflection_text, filename="trading_memory.md"):
     """Write a completed entry directly to file, bypassing the API."""
     entry = (
@@ -290,6 +305,141 @@ class TestTradingMemoryLogCore:
         ctx = log.get_past_context("NVDA")
         assert "Recent cross-ticker lessons" in ctx
         assert "Past analyses of NVDA" not in ctx
+
+    def test_past_context_respects_char_budget(self, tmp_path):
+        """A long decision must stay within the injected-context budget, without losing its lesson."""
+        log = TradingMemoryLog({
+            "memory_log_path": str(tmp_path / "trading_memory.md"),
+            "memory_context_max_chars": 2000,
+        })
+        decision = "长正文。" * 1000
+        reflection = "这条经验值得保留。"
+        log.store_decision("NVDA", "2026-01-05", decision, rating="Buy")
+        log.update_with_outcome(
+            "NVDA", "2026-01-05", 0.05, 0.02, 5, reflection,
+            resolution_date="2026-01-10",
+        )
+
+        ctx = log.get_past_context("NVDA", as_of="2026-01-12")
+
+        assert len(ctx) <= 2000
+        assert reflection in ctx
+
+    def test_past_context_budget_keeps_reflection_without_long_decision(self, tmp_path):
+        log = make_budget_log(tmp_path, 2000)
+        body = "长正文。" * 1000
+        reflection = "这条经验值得保留。"
+        settle_entry(log, "NVDA", "2026-01-05", body, reflection, "2026-01-10")
+
+        ctx = log.get_past_context("NVDA", as_of="2026-01-12")
+
+        assert "REFLECTION:\n" + reflection in ctx
+        assert body not in ctx
+        assert "长正文" not in ctx
+        assert "DECISION:" not in ctx
+
+    def test_past_context_budget_prefers_same_ticker_then_newest(self, tmp_path):
+        log = make_budget_log(tmp_path, 110)
+        settle_entry(log, "NVDA", "2026-01-05", "旧正文。" * 200, "旧的同标经验", "2026-01-06")
+        settle_entry(log, "NVDA", "2026-01-12", "新正文。" * 200, "新的同标经验", "2026-01-13")
+        settle_entry(log, "AAPL", "2026-01-11", "跨正文。" * 200, "跨标经验", "2026-01-12")
+
+        ctx = log.get_past_context("NVDA")
+
+        assert "新的同标经验" in ctx
+        assert "旧的同标经验" not in ctx
+        assert "跨标经验" not in ctx
+        assert len(ctx) <= 110
+
+    def test_past_context_budget_prefers_same_ticker_even_when_cross_is_newer(self, tmp_path):
+        log = make_budget_log(tmp_path, 110)
+        settle_entry(log, "NVDA", "2026-01-05", "旧正文。" * 200, "旧的同标经验", "2026-01-06")
+        settle_entry(log, "NVDA", "2026-01-12", "新正文。" * 200, "新的同标经验", "2026-01-13")
+        settle_entry(log, "AAPL", "2026-01-15", "跨正文。" * 200, "跨标经验", "2026-01-16")
+
+        ctx = log.get_past_context("NVDA")
+
+        assert "新的同标经验" in ctx
+        assert "跨标经验" not in ctx
+        assert "旧的同标经验" not in ctx
+        assert len(ctx) <= 110
+
+    def test_past_context_budget_skips_entry_too_long_in_both_forms(self, tmp_path):
+        log = make_budget_log(tmp_path, 2000)
+        oversized_reflection = "超长反思。" * 500
+        settle_entry(log, "NVDA", "2026-01-12", "最新正文。", oversized_reflection, "2026-01-13")
+        settle_entry(log, "NVDA", "2026-01-05", "较早正文。", "能放下的经验", "2026-01-06")
+
+        ctx = log.get_past_context("NVDA")
+
+        assert "能放下的经验" in ctx
+        assert oversized_reflection not in ctx
+        assert len(ctx) <= 2000
+
+    def test_past_context_budget_accepts_exact_limit(self, tmp_path):
+        def seed(log):
+            settle_entry(log, "NVDA", "2026-01-05", "买入NVDA。", "同标经验", "2026-01-06")
+            settle_entry(log, "AAPL", "2026-01-06", "卖出AAPL。", "跨标经验", "2026-01-07")
+
+        unbounded = make_log(tmp_path, "unbounded.md")
+        seed(unbounded)
+        expected = unbounded.get_past_context("NVDA")
+
+        bounded = make_budget_log(tmp_path, len(expected), "bounded.md")
+        seed(bounded)
+        ctx = bounded.get_past_context("NVDA")
+
+        assert ctx == expected
+        assert len(ctx) == len(expected)
+
+    def test_past_context_budget_one_char_short_drops_cross_ticker(self, tmp_path):
+        def seed(log):
+            settle_entry(log, "NVDA", "2026-01-05", "买入NVDA。", "同标经验", "2026-01-06")
+            settle_entry(log, "AAPL", "2026-01-06", "卖出AAPL。", "跨标经验", "2026-01-07")
+
+        unbounded = make_log(tmp_path, "unbounded.md")
+        seed(unbounded)
+        full = unbounded.get_past_context("NVDA")
+        same_only = full.split("\n\nRecent cross-ticker lessons:")[0]
+
+        bounded = make_budget_log(tmp_path, len(full) - 1, "short.md")
+        seed(bounded)
+        ctx = bounded.get_past_context("NVDA")
+
+        assert ctx == same_only
+        assert "同标经验" in ctx
+        assert "买入NVDA。" in ctx
+        assert "跨标经验" not in ctx
+        assert "Recent cross-ticker lessons:" not in ctx
+        assert len(ctx) <= len(full) - 1
+
+    def test_past_context_zero_budget_returns_empty(self, tmp_path):
+        log = make_budget_log(tmp_path, 0)
+        settle_entry(log, "NVDA", "2026-01-05", "买入NVDA。", "同标经验", "2026-01-06")
+
+        assert log.get_past_context("NVDA") == ""
+
+    def test_past_context_budget_keeps_as_of_filter(self, tmp_path):
+        log = make_budget_log(tmp_path, 2000)
+        reflection = "这条经验值得保留。"
+        settle_entry(log, "NVDA", "2026-01-05", "长正文。" * 1000, reflection, "2026-01-10")
+
+        assert log.get_past_context("NVDA", as_of="2026-01-09") == ""
+        ctx = log.get_past_context("NVDA", as_of="2026-01-12")
+        assert reflection in ctx
+        assert len(ctx) <= 2000
+
+    def test_past_context_without_budget_keeps_full_decision(self, tmp_path):
+        body = "长正文。" * 1000
+        for config in (
+            {"memory_log_path": str(tmp_path / "unset.md")},
+            {"memory_log_path": str(tmp_path / "none.md"), "memory_context_max_chars": None},
+        ):
+            log = TradingMemoryLog(config)
+            settle_entry(log, "NVDA", "2026-01-05", body, "这条经验值得保留。", "2026-01-10")
+            ctx = log.get_past_context("NVDA")
+            assert body in ctx
+            assert len(ctx) > 2000
 
     def test_n_same_limit_respected(self, tmp_path):
         """Only the n_same most recent same-ticker entries are included."""

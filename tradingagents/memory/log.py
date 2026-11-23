@@ -26,6 +26,8 @@ class TradingMemoryLog:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
         # Optional cap on resolved entries. None disables rotation.
         self._max_entries = cfg.get("memory_log_max_entries")
+        # Optional cap on injected context, measured with len() on the final text.
+        self._context_max_chars = cfg.get("memory_context_max_chars")
 
     # --- Write: a run records its decision ---
 
@@ -101,36 +103,66 @@ class TradingMemoryLog:
         ``as_of``. This keeps a historical/backtest run from learning from
         outcomes that had not happened yet (#1251). ``as_of=None`` disables the
         filter, so live runs and pre-migration entries are unaffected.
+
+        ``memory_context_max_chars`` caps the text returned here (headers and
+        separators included). Without a cap the full decisions are returned as
+        before; with one, an oversized same-ticker entry falls back to a brief
+        version without its decision body, and is skipped if that still does
+        not fit. ``n_same`` and ``n_cross`` count the entries actually kept.
         """
         entries = [e for e in self.load_entries() if not e.get("pending")]
         if as_of is not None:
             entries = [e for e in entries if e.get("resolved") and e["resolved"] <= as_of]
         if not entries:
             return ""
-
-        same, cross = [], []
-        # Most recent by decision date, then by the later write: a backfill writes
-        # older decisions last.
-        newest = sorted(range(len(entries)), key=lambda i: (entries[i]["date"], i), reverse=True)
-        for e in (entries[i] for i in newest):
-            if len(same) >= n_same and len(cross) >= n_cross:
-                break
-            if e["ticker"] == ticker and len(same) < n_same:
-                same.append(e)
-            elif e["ticker"] != ticker and len(cross) < n_cross:
-                cross.append(e)
-
-        if not same and not cross:
+        budget = self._context_max_chars
+        if budget is not None and budget <= 0:
             return ""
 
-        parts = []
-        if same:
-            parts.append(f"Past analyses of {ticker} (most recent first):")
-            parts.extend(self._format_full(e) for e in same)
-        if cross:
-            parts.append("Recent cross-ticker lessons:")
-            parts.extend(self._format_reflection_only(e) for e in cross)
-        return "\n\n".join(parts)
+        # Most recent by decision date, then by the later write: a backfill writes
+        # older decisions last. Same-ticker lessons are chosen before cross-ticker ones.
+        newest = sorted(range(len(entries)), key=lambda i: (entries[i]["date"], i), reverse=True)
+        same = [entries[i] for i in newest if entries[i]["ticker"] == ticker]
+        cross = [entries[i] for i in newest if entries[i]["ticker"] != ticker]
+        chosen_same: list[str] = []
+        chosen_cross: list[str] = []
+
+        def assemble(same_items: list[str], cross_items: list[str]) -> str:
+            parts = []
+            if same_items:
+                parts.append(f"Past analyses of {ticker} (most recent first):")
+                parts.extend(same_items)
+            if cross_items:
+                parts.append("Recent cross-ticker lessons:")
+                parts.extend(cross_items)
+            return "\n\n".join(parts)
+
+        def fits(text: str, section: str) -> bool:
+            if budget is None:
+                return True
+            same_items = chosen_same + [text] if section == "same" else chosen_same
+            cross_items = chosen_cross + [text] if section == "cross" else chosen_cross
+            return len(assemble(same_items, cross_items)) <= budget
+
+        for e in same:
+            if len(chosen_same) >= n_same:
+                break
+            full = self._format_full(e)
+            if fits(full, "same"):
+                chosen_same.append(full)
+                continue
+            brief = self._format_compact(e)
+            if fits(brief, "same"):
+                chosen_same.append(brief)
+
+        for e in cross:
+            if len(chosen_cross) >= n_cross:
+                break
+            brief = self._format_reflection_only(e)
+            if fits(brief, "cross"):
+                chosen_cross.append(brief)
+
+        return assemble(chosen_same, chosen_cross)
 
     # --- Settle: record a decision's outcome and reflection ---
 
@@ -350,6 +382,16 @@ class TradingMemoryLog:
         if e["reflection"]:
             parts.append(f"REFLECTION:\n{e['reflection']}")
         return "\n\n".join(parts)
+
+    def _format_compact(self, e: dict) -> str:
+        """Same-ticker fallback: keep the outcome and lesson, drop the decision body."""
+        tag = (
+            f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}"
+            f" | {e['alpha'] or 'n/a'} | {e['holding'] or 'n/a'}]"
+        )
+        if e["reflection"]:
+            return f"{tag}\n\nREFLECTION:\n{e['reflection']}"
+        return tag
 
     def _format_reflection_only(self, e: dict) -> str:
         tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}]"
