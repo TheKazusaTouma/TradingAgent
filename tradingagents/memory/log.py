@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tradingagents.agents.rating import parse_rating
 from tradingagents.dataflows.files import locked
+from tradingagents.memory.review import ReviewCutoff, ReviewLedger
 
 
 class TradingMemoryLog:
@@ -93,7 +94,13 @@ class TradingMemoryLog:
         return [e for e in self.load_entries() if e.get("pending")]
 
     def get_past_context(
-        self, ticker: str, n_same: int = 5, n_cross: int = 3, as_of: str | None = None
+        self,
+        ticker: str,
+        n_same: int = 5,
+        n_cross: int = 3,
+        as_of: str | None = None,
+        review_ledger: ReviewLedger | None = None,
+        cutoff: ReviewCutoff | None = None,
     ) -> str:
         """Return formatted past context string for agent prompt injection.
 
@@ -104,6 +111,10 @@ class TradingMemoryLog:
         outcomes that had not happened yet (#1251). ``as_of=None`` disables the
         filter, so live runs and pre-migration entries are unaffected.
 
+        With ``review_ledger``, only a settled entry whose current reflection
+        has an effective approval at ``cutoff`` is included. The approval binds
+        the reflection's fingerprint, so changed text needs a fresh approval.
+
         ``memory_context_max_chars`` caps the text returned here (headers and
         separators included). Without a cap the full decisions are returned as
         before; with one, an oversized same-ticker entry falls back to a brief
@@ -113,6 +124,15 @@ class TradingMemoryLog:
         entries = [e for e in self.load_entries() if not e.get("pending")]
         if as_of is not None:
             entries = [e for e in entries if e.get("resolved") and e["resolved"] <= as_of]
+        if review_ledger is not None:
+            # Read and replay the ledger once, then judge every candidate against
+            # that one view rather than reading again per candidate.
+            snapshot = review_ledger.snapshot(cutoff)
+            entries = [
+                e for e in entries
+                if e.get("reflection")
+                and snapshot.status(e["ticker"], e["date"], e["reflection"]) == "approved"
+            ]
         if not entries:
             return ""
         budget = self._context_max_chars

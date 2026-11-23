@@ -26,6 +26,7 @@ def test_no_env_uses_built_in_defaults(monkeypatch):
     assert config["backend_url"] is None
     assert config["max_debate_rounds"] == 1
     assert config["checkpoint_enabled"] is False
+    assert config["memory_review_enabled"] is False
 
 
 def test_string_overrides(monkeypatch):
@@ -66,6 +67,18 @@ def test_int_coercion(monkeypatch):
 def test_bool_coercion(monkeypatch, raw, expected):
     config = _config_with_env(monkeypatch, TRADINGAGENTS_CHECKPOINT_ENABLED=raw)
     assert config["checkpoint_enabled"] is expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("true", True), ("1", True), ("yes", True), ("on", True),
+        ("false", False), ("0", False), ("no", False), ("off", False),
+    ],
+)
+def test_memory_review_bool_coercion(monkeypatch, raw, expected):
+    config = _config_with_env(monkeypatch, TRADINGAGENTS_MEMORY_REVIEW_ENABLED=raw)
+    assert config["memory_review_enabled"] is expected
 
 
 def test_reasoning_thinking_overrides(monkeypatch):

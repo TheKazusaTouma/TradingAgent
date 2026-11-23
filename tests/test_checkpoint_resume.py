@@ -218,6 +218,28 @@ class TestCheckpointSignature(unittest.TestCase):
         g.config = dict(base_config)
         self.assertEqual(base, g._run_signature("stock"))
 
+    def test_memory_review_keeps_the_old_signature_when_off_and_its_own_when_on(self):
+        """An old checkpoint must resume with review off, but not carry work into
+        a review-enabled run whose memory input differs."""
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+        g = object.__new__(TradingAgentsGraph)
+        g.selected_analysts = ("market", "news")
+        base_config = {"max_debate_rounds": 1, "max_risk_discuss_rounds": 1}
+        g.config = dict(base_config)
+        legacy = g._run_signature("stock")
+
+        g.config = {**base_config, "memory_review_enabled": False}
+        self.assertEqual(legacy, g._run_signature("stock"))
+
+        g.config = {**base_config, "memory_review_enabled": True}
+        self.assertNotEqual(legacy, g._run_signature("stock"))
+        self.assertIn("memory=review", g._run_signature("stock"))
+
+        # The enabled signature is stable.
+        enabled = g._run_signature("stock")
+        self.assertEqual(enabled, g._run_signature("stock"))
+
     def test_run_signature_captures_graph_shape(self):
         from tradingagents.graph.trading_graph import TradingAgentsGraph
 

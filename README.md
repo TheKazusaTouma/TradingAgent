@@ -340,6 +340,21 @@ Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
 
 To settle decisions without running an analysis, for a scheduled job, call `ta.settle_all_pending()`; it returns the decisions it settled and any it could not.
 
+### Reviewing memory reflections
+
+Set `TRADINGAGENTS_MEMORY_REVIEW_ENABLED=true` to require a person to approve a settled reflection before a later run may use it. The Memory Log step still settles decisions alongside the analysts; the Portfolio Manager reads only approved reflections, once, just before it assembles its prompt. A resumed run reads the ledger again, so a revocation saved before the resume applies.
+
+Approvals live in a JSONL ledger beside the memory log (`trading_memory.reviews.jsonl`). Each approval binds the reflection text that was shown: editing the reflection afterwards withdraws the approval until it is approved again, and restoring an earlier version brings that version's own approval back. A ledger that cannot be read fails closed, with the reason in the run's report.
+
+```bash
+tradingagents memory list
+tradingagents memory approve NVDA 2026-01-02   # prints the reflection, then asks before binding it
+tradingagents memory revoke NVDA 2026-01-02
+tradingagents memory history NVDA 2026-01-02
+```
+
+A historical run only sees review events before midnight UTC after its analysis date, so replaying an old analysis cannot use a later approval or revocation.
+
 ### Checkpoint resume
 
 Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves state after each node so a crashed or interrupted run resumes from the last successful step instead of starting over. The run view says whether it resumed a saved run or started fresh. Checkpoints are cleared automatically on successful completion.

@@ -8,7 +8,11 @@ the wiring: a restructure that drops a node, a tool or an edge fails here.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -24,6 +28,8 @@ from tradingagents.dataflows import router
 from tradingagents.dataflows.vendors.yahoo import market as yahoo_market, snapshot
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph import trading_graph
+from tradingagents.graph.checkpointer import checkpoint_step
+from tradingagents.memory import TradingMemoryLog
 
 TRADE_DATE = "2026-01-09"
 
@@ -126,6 +132,56 @@ def _graph(tmp_path, monkeypatch, model, debug=False, **config):
                memory_log_path=str(tmp_path / "log.md"), **config)
     monkeypatch.setattr(trading_graph, "create_tier_client", lambda config, tier, **k: _Client(model))
     return trading_graph.TradingAgentsGraph(config=cfg, debug=debug)
+
+
+REVIEW_REFLECTION = "REFLECTION_MARKER_WAIT_FOR_PULLBACK"
+REVIEW_TICKER = "NVDA"
+REVIEW_DECISION_DATE = "2026-01-02"
+REVIEW_RESOLUTION_DATE = "2026-01-08"
+
+
+def _review_ledger_path(log_path: Path) -> Path:
+    return Path(log_path).with_suffix(".reviews.jsonl")
+
+
+def _reflection_fingerprint(reflection: str) -> str:
+    return hashlib.sha256(reflection.encode("utf-8")).hexdigest()
+
+
+def _write_settled_memory(log_path: Path, reflection: str = REVIEW_REFLECTION) -> None:
+    log_path.write_text(
+        f"[{REVIEW_DECISION_DATE} | {REVIEW_TICKER} | Buy | +5.0% | +2.0% | 5d | "
+        f"resolved:{REVIEW_RESOLUTION_DATE}]\n\n"
+        f"DECISION:\nRating: Buy\n\nBuy {REVIEW_TICKER}.\n\n"
+        f"REFLECTION:\n{reflection}"
+        f"{TradingMemoryLog._SEPARATOR}",
+        encoding="utf-8",
+    )
+
+
+def _ledger_line(action: str, at: str, fingerprint: str) -> str:
+    return json.dumps({
+        "ticker": REVIEW_TICKER,
+        "decision_date": REVIEW_DECISION_DATE,
+        "reflection_sha256": fingerprint,
+        "action": action,
+        "at": at,
+    })
+
+
+def _write_ledger(log_path: Path, lines: list[str]) -> None:
+    _review_ledger_path(log_path).write_text(
+        "".join(f"{line}\n" for line in lines), encoding="utf-8"
+    )
+
+
+def _append_ledger(log_path: Path, line: str) -> None:
+    with _review_ledger_path(log_path).open("a", encoding="utf-8") as f:
+        f.write(f"{line}\n")
+
+
+def _pm_prompts(model) -> list[str]:
+    return [prompt for step, prompt, *_ in model.seen if step == "Portfolio Manager"]
 
 
 @pytest.mark.unit
@@ -306,6 +362,33 @@ class TimedModel(ScriptedModel):
         return result
 
 
+RESEARCH_PLAN_MARKER = "RESEARCH_PLAN_MARKER_ENTER_ON_PULLBACK"
+TRADER_PROPOSAL_MARKER = "TRADER_PROPOSAL_MARKER_SCALE_IN_THIRDS"
+RISK_DEBATE_MARKER = "RISK_DEBATE_MARKER_POSITION_SIZE"
+
+
+class _MaterialMarkerModel(TimedModel):
+    """Gives each current-run material its own marker, so a test can prove it
+    reached the Portfolio Manager independently of the memory lesson."""
+
+    @staticmethod
+    def _answer(content: str) -> ChatResult:
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        result = super()._generate(messages, stop, run_manager, **kwargs)
+        step = (run_manager.metadata or {}).get("langgraph_node") if run_manager else None
+        if step == "Research Manager":
+            return self._answer(RESEARCH_PLAN_MARKER)
+        if step == "Trader":
+            return self._answer(TRADER_PROPOSAL_MARKER)
+        if step in {"Aggressive Analyst", "Conservative Analyst", "Neutral Analyst"}:
+            return self._answer(f"{RISK_DEBATE_MARKER} from {step}")
+        if step == "Portfolio Manager":
+            return self._answer("**Rating**: Overweight\n\nUse the stronger risk case.")
+        return result
+
+
 @pytest.mark.unit
 def test_past_decisions_settle_alongside_the_analysts(tmp_path, monkeypatch, offline):
     from tradingagents.memory import settlement
@@ -328,6 +411,247 @@ def test_past_decisions_settle_alongside_the_analysts(tmp_path, monkeypatch, off
     assert lessons
     pm_prompt = next(c[1] for c in model.seen if c[0] == "Portfolio Manager")
     assert lessons in pm_prompt
+
+
+class _FailOnceAtPMModel(_MaterialMarkerModel):
+    """Captures the Portfolio Manager prompt, then interrupts the first run."""
+
+    failed_at_pm: bool = False
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        result = super()._generate(messages, stop, run_manager, **kwargs)
+        step = (run_manager.metadata or {}).get("langgraph_node") if run_manager else None
+        if step == "Portfolio Manager" and not self.failed_at_pm:
+            self.failed_at_pm = True
+            raise RuntimeError("interrupt after Portfolio Manager input")
+        return result
+
+
+@pytest.mark.unit
+def test_review_enabled_without_approval_hides_reflection_but_keeps_current_materials(
+    tmp_path, monkeypatch, offline
+):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    model = _MaterialMarkerModel()
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=True)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    pm_prompt = _pm_prompts(model)[-1]
+    assert REVIEW_REFLECTION not in pm_prompt
+    assert state["investment_plan"] == RESEARCH_PLAN_MARKER
+    assert state["trader_investment_plan"] == TRADER_PROPOSAL_MARKER
+    assert RISK_DEBATE_MARKER in state["risk_debate_state"]["history"]
+    assert RESEARCH_PLAN_MARKER in pm_prompt
+    assert TRADER_PROPOSAL_MARKER in pm_prompt
+    assert RISK_DEBATE_MARKER in pm_prompt
+
+
+@pytest.mark.unit
+def test_review_disabled_keeps_the_existing_automatic_memory_path(
+    tmp_path, monkeypatch, offline
+):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    model = _MaterialMarkerModel()
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=False)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    pm_prompt = _pm_prompts(model)[-1]
+    assert REVIEW_REFLECTION in pm_prompt
+    assert state["investment_plan"] == RESEARCH_PLAN_MARKER
+    assert state["trader_investment_plan"] == TRADER_PROPOSAL_MARKER
+    assert RISK_DEBATE_MARKER in state["risk_debate_state"]["history"]
+    assert RESEARCH_PLAN_MARKER in pm_prompt
+    assert TRADER_PROPOSAL_MARKER in pm_prompt
+    assert RISK_DEBATE_MARKER in pm_prompt
+
+
+@pytest.mark.unit
+def test_a_corrupt_review_ledger_fails_closed_and_reports_the_reason(
+    tmp_path, monkeypatch, offline
+):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    fingerprint = _reflection_fingerprint(REVIEW_REFLECTION)
+    approve = _ledger_line("approve", "2026-01-09T10:00:00+00:00", fingerprint)
+    damaged_revoke = (
+        '{"ticker":"NVDA","decision_date":"2026-01-02",'
+        f'"reflection_sha256":"{fingerprint}","action":"revoke"'
+    )
+    _write_ledger(log_path, [approve, damaged_revoke])
+
+    model = _MaterialMarkerModel()
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=True)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    pm_prompt = _pm_prompts(model)[-1]
+    assert REVIEW_REFLECTION not in pm_prompt
+    note = state.get("memory_note", "").lower()
+    assert "review ledger" in note
+    assert "could not be read" in note
+    assert state["investment_plan"] == RESEARCH_PLAN_MARKER
+    assert state["trader_investment_plan"] == TRADER_PROPOSAL_MARKER
+    assert RISK_DEBATE_MARKER in state["risk_debate_state"]["history"]
+    assert RESEARCH_PLAN_MARKER in pm_prompt
+    assert TRADER_PROPOSAL_MARKER in pm_prompt
+    assert RISK_DEBATE_MARKER in pm_prompt
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("local_today, utc_now, expect_reflection, label", [
+    # Live run: the local calendar is still the analysis date, but UTC has
+    # crossed into the next day. A revocation after UTC midnight happened after
+    # the historical cutoff but before this run, so it must apply.
+    ("2026-01-09", datetime(2026, 1, 10, 0, 30, tzinfo=UTC), False, "live"),
+    # Historical replay: the local calendar has moved past the analysis date, so
+    # the same revocation is after the analysis date's midnight cutoff and must
+    # not affect the replay.
+    ("2026-01-12", datetime(2026, 1, 12, 12, 0, tzinfo=UTC), True, "historical"),
+])
+def test_the_review_cutoff_follows_the_run_mode_when_local_and_utc_dates_differ(
+    tmp_path, monkeypatch, offline, local_today, utc_now, expect_reflection, label
+):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    fingerprint = _reflection_fingerprint(REVIEW_REFLECTION)
+    _write_ledger(log_path, [
+        _ledger_line("approve", f"{REVIEW_DECISION_DATE}T10:00:00+00:00", fingerprint),
+        _ledger_line("revoke", "2026-01-10T00:30:00+00:00", fingerprint),
+    ])
+    from tradingagents.dataflows import date_window
+
+    monkeypatch.setattr(date_window, "get_current_date", lambda: local_today)
+    monkeypatch.setattr(trading_graph, "get_current_date", lambda: local_today)
+    monkeypatch.setattr(trading_graph, "_utc_now", lambda: utc_now)
+    model = _MaterialMarkerModel()
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=True)
+
+    state, signal = graph.propagate("NVDA", "2026-01-09")
+
+    assert signal == "Overweight", label
+    pm_prompt = _pm_prompts(model)[-1]
+    if expect_reflection:
+        assert REVIEW_REFLECTION in pm_prompt, label
+    else:
+        assert REVIEW_REFLECTION not in pm_prompt, label
+    assert RESEARCH_PLAN_MARKER in pm_prompt
+    assert TRADER_PROPOSAL_MARKER in pm_prompt
+    assert RISK_DEBATE_MARKER in pm_prompt
+
+
+@pytest.mark.unit
+def test_one_pm_read_decides_the_run_mode_once(tmp_path, monkeypatch, offline):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    fingerprint = _reflection_fingerprint(REVIEW_REFLECTION)
+    _write_ledger(log_path, [_ledger_line("approve", "2026-01-09T10:00:00+00:00", fingerprint)])
+    model = _MaterialMarkerModel()
+
+    calls = []
+    real = trading_graph.is_historical
+    monkeypatch.setattr(
+        trading_graph, "is_historical",
+        lambda value: calls.append(value) or real(value),
+    )
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=True)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    assert REVIEW_REFLECTION in _pm_prompts(model)[-1]
+    # as_of and the review cutoff are derived from one decision, not two.
+    assert calls == [TRADE_DATE]
+
+
+@pytest.mark.unit
+def test_resume_after_revoke_excludes_the_reflection_and_keeps_current_materials(
+    tmp_path, monkeypatch, offline
+):
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    fingerprint = _reflection_fingerprint(REVIEW_REFLECTION)
+    _write_ledger(log_path, [_ledger_line("approve", "2026-01-09T10:00:00+00:00", fingerprint)])
+
+    model = _FailOnceAtPMModel()
+    graph = _graph(
+        tmp_path, monkeypatch, model,
+        memory_review_enabled=True, checkpoint_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupt after Portfolio Manager input"):
+        graph.propagate("NVDA", TRADE_DATE)
+
+    first_prompts = _pm_prompts(model)
+    assert len(first_prompts) == 1
+    assert REVIEW_REFLECTION in first_prompts[0]
+
+    signature = graph._run_signature("stock")
+    assert checkpoint_step(str(tmp_path / "cache"), "NVDA", TRADE_DATE, signature) is not None
+
+    _append_ledger(log_path, _ledger_line("revoke", "2026-01-09T12:00:00+00:00", fingerprint))
+    calls_before_resume = len(model.seen)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    assert len(model.seen) - calls_before_resume == 1
+    assert model.seen[-1][0] == "Portfolio Manager"
+    pm_prompts = _pm_prompts(model)
+    assert len(pm_prompts) == 2
+    assert REVIEW_REFLECTION in pm_prompts[0]
+    assert REVIEW_REFLECTION not in pm_prompts[1]
+    assert state["investment_plan"] == RESEARCH_PLAN_MARKER
+    assert state["trader_investment_plan"] == TRADER_PROPOSAL_MARKER
+    assert RISK_DEBATE_MARKER in state["risk_debate_state"]["history"]
+    assert RESEARCH_PLAN_MARKER in pm_prompts[1]
+    assert TRADER_PROPOSAL_MARKER in pm_prompts[1]
+    assert RISK_DEBATE_MARKER in pm_prompts[1]
+    assert checkpoint_step(str(tmp_path / "cache"), "NVDA", TRADE_DATE, signature) is None
+
+
+@pytest.mark.unit
+def test_the_reports_show_the_same_memory_the_portfolio_manager_received(
+    tmp_path, monkeypatch, offline
+):
+    """The reports read the PM's past_context, so they cannot disagree with the
+    model input, and building them never re-reads the review ledger."""
+    log_path = tmp_path / "log.md"
+    _write_settled_memory(log_path)
+    fingerprint = _reflection_fingerprint(REVIEW_REFLECTION)
+    _write_ledger(log_path, [_ledger_line("approve", "2026-01-09T10:00:00+00:00", fingerprint)])
+    model = _MaterialMarkerModel()
+    graph = _graph(tmp_path, monkeypatch, model, memory_review_enabled=True)
+
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert signal == "Overweight"
+    pm_prompt = _pm_prompts(model)[-1]
+    assert REVIEW_REFLECTION in pm_prompt
+    assert state["past_context"]
+    assert REVIEW_REFLECTION in state["past_context"]
+
+    # A ledger read after the run would be a second source of truth; make the
+    # actual read entry point fail to prove the report uses the PM's
+    # written-back context instead.
+    monkeypatch.setattr(
+        graph.review_ledger, "events",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("report re-read the ledger")),
+    )
+    from tradingagents.reporting import write_report_tree
+
+    report_dir = tmp_path / "report"
+    write_report_tree(state, "NVDA", report_dir)
+    markdown = (report_dir / "complete_report.md").read_text()
+    html = (report_dir / "complete_report.html").read_text()
+    assert "Memory" in markdown and "REFLECTION_MARKER_WAIT_FOR_PULLBACK" in markdown
+    assert "REFLECTION_MARKER_WAIT_FOR_PULLBACK" in html
 
 
 @pytest.mark.unit
