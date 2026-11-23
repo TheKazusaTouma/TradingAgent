@@ -112,6 +112,43 @@ def _coerce_ohlcv_dates(data: pd.DataFrame) -> pd.Series:
     return pd.Series(dtype="datetime64[ns]")
 
 
+def _has_usable_bar(data: pd.DataFrame) -> bool:
+    """Whether a frame holds at least one row with both a parseable date and a
+    finite numeric close.
+
+    Validation is done on normalized dates and coerced numerics, aligned by row,
+    so a frame whose valid date and valid close fall on *different* rows has no
+    usable bar. This is independent of the caller's ``as_of_date``: it decides
+    only whether the content is worth storing/serving, not whether it covers a
+    particular date.
+    """
+    if data is None or data.empty or "Close" not in data.columns:
+        return False
+    frame = _ensure_date_column(data)
+    if "Date" not in frame.columns:
+        return False
+    dates = _normalize_dates(frame["Date"])
+    closes = pd.to_numeric(frame["Close"], errors="coerce")
+    usable = dates.notna() & closes.notna()
+    return bool(usable.any())
+
+
+def _read_cached_csv(data_file: str):
+    """Read a cached CSV, treating unreadable or unusable content as a miss.
+
+    A zero-byte, malformed, or contentless cache (e.g. a symbol with a ``Close``
+    column but no row carrying both a date and a close) is not usable; return
+    ``None`` so the caller refetches rather than crashing or serving it.
+    """
+    try:
+        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        return None
+    if cached.empty or "Close" not in cached.columns or not _has_usable_bar(cached):
+        return None
+    return cached
+
+
 def _assert_ohlcv_not_stale(
     data: pd.DataFrame,
     as_of_date: str,
@@ -199,17 +236,14 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
         f"{safe_symbol}-YFin-data.csv",
     )
 
-    # A cached file may be empty if a prior fetch failed (unknown symbol,
-    # transient rate limit). Treat an empty/columnless cache as a miss and
-    # re-fetch rather than serving the poisoned file forever.
+    # A cached file may be empty or malformed if a prior fetch failed (unknown
+    # symbol, transient rate limit) or was corrupted on disk. Treat unreadable
+    # or unusable content as a miss and re-fetch rather than crashing or serving
+    # the poisoned file forever.
     data = None
     if os.path.exists(data_file):
-        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-        if (
-            not cached.empty
-            and "Close" in cached.columns
-            and _cache_is_fresh(data_file, as_of_dt, now)
-        ):
+        cached = _read_cached_csv(data_file)
+        if cached is not None and _cache_is_fresh(data_file, as_of_dt, now):
             data = cached
 
     if data is None:
@@ -221,12 +255,8 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
 
         def _load() -> pd.DataFrame:
             if os.path.exists(data_file):
-                recheck = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-                if (
-                    not recheck.empty
-                    and "Close" in recheck.columns
-                    and _cache_is_fresh(data_file, as_of_dt, now)
-                ):
+                recheck = _read_cached_csv(data_file)
+                if recheck is not None and _cache_is_fresh(data_file, as_of_dt, now):
                     return recheck
 
             # yf.download catches every error, a rate limit included, and returns
@@ -240,9 +270,15 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
             if downloaded is None:
                 raise_for_empty(symbol, canonical, "price rows")
             downloaded = _ensure_date_column(downloaded.reset_index())
-            # Only cache real data — never persist an empty frame.
+            # Validate the raw download for storage *before* writing: an empty
+            # frame, a missing Close column, or a frame with no row carrying both
+            # a parseable date and a finite close is not written, so it can never
+            # poison (or overwrite) the cache file. This check is independent of
+            # the caller's as_of_date — it only judges content worth keeping.
             if downloaded.empty or "Close" not in downloaded.columns:
                 raise_for_empty(symbol, canonical, "price rows")
+            if not _has_usable_bar(downloaded):
+                raise_for_empty(symbol, canonical, "usable price rows")
             replace_file(
                 data_file,
                 lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"),

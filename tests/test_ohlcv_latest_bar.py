@@ -126,13 +126,28 @@ def test_unsettled_latest_bar_is_served_as_the_last_settled_bar(monkeypatch, tmp
 
 @pytest.mark.unit
 def test_no_settled_bar_at_all_is_still_no_data(monkeypatch, tmp_path):
+    # A cache with a date but no closing price anywhere has no usable bar, so it
+    # is treated as a miss (not served): the refetch likewise has no usable bar
+    # and the call is still no data — it never returns an empty frame.
+    from tradingagents.dataflows.vendors.yahoo import common
+
     frame = pd.DataFrame({
         "Date": ["2026-05-07", "2026-05-08"],
         "Open": [100.0, 101.0], "High": [101.0, 102.0], "Low": [99.0, 100.0],
         "Close": [float("nan"), float("nan")], "Volume": [1_000_000, 1_000_000],
     })
-    with pytest.raises(NoMarketDataError, match="no bar in range has a closing price"):
-        _run_load(monkeypatch, tmp_path, frame, "2026-05-08")
+    monkeypatch.setattr(ohlcv, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    # Yahoo answers (reachable), so "no usable rows" means no data, not an outage.
+    monkeypatch.setattr(common, "vendor_reachable", lambda *a, **k: True)
+    today = pd.Timestamp("2026-05-08")
+    monkeypatch.setattr(ohlcv.pd.Timestamp, "today", staticmethod(lambda: today))
+    cache_file = tmp_path / "AAPL-YFin-data.csv"
+    cache_file.write_text(frame.to_csv(index=False))
+    _stamp(cache_file, today)
+    monkeypatch.setattr(ohlcv.yf, "Ticker", lambda symbol: SimpleNamespace(
+        history=lambda *a, **k: frame.set_index("Date").copy()))
+    with pytest.raises(NoMarketDataError, match="usable price rows"):
+        ohlcv.load_ohlcv("AAPL", "2026-05-08")
 
 
 @pytest.mark.unit
