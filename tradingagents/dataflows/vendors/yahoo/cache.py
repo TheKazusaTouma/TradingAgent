@@ -93,6 +93,53 @@ class _RangeCache:
         return len(self._entries)
 
 
+_STAT_FIELDS = (
+    "memory_hits",
+    "disk_hits",
+    "coalesced_waits",
+    "load_attempts",
+    "load_failures",
+)
+
+
+class CacheStats:
+    """Thread-safe, process-local counters for the Yahoo cache paths.
+
+    Every counter is advanced under one lock so a snapshot is a consistent
+    point-in-time view. The counters describe *outcomes*, not provider retries:
+
+    * ``load_attempts`` — a caller that actually began a data-source load (the
+      leader of an in-flight flight whose recheck missed). A single shared load
+      counts once even when ``yf_retry`` retries the provider internally.
+    * ``load_failures`` — a shared load that raised. Counted once per load, not
+      once per caller, even when every waiter receives the same error.
+    * ``coalesced_waits`` — a follower that joined an in-flight flight and
+      waited, whether it ultimately got the shared result or the shared error.
+    * ``memory_hits`` / ``disk_hits`` — a request served from the in-memory
+      range cache or the on-disk five-year CSV without starting a load.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts = dict.fromkeys(_STAT_FIELDS, 0)
+
+    def incr(self, name: str, amount: int = 1) -> None:
+        with self._lock:
+            self._counts[name] += amount
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counts = dict.fromkeys(_STAT_FIELDS, 0)
+
+
+# One process-local statistics object shared by both Yahoo cache paths.
+STATS = CacheStats()
+
+
 @dataclass
 class _Flight:
     """One provider load other callers can wait on and share.
@@ -119,9 +166,11 @@ class _Inflight:
     Different keys occupy separate flights and load independently.
     """
 
-    def __init__(self):
+    def __init__(self, stats: CacheStats | None = None):
         self._lock = threading.Lock()
         self._flights: dict[tuple, _Flight] = {}
+        # Followers recorded here count even if they get the shared result or error.
+        self._stats = stats if stats is not None else STATS
 
     def run(self, key: tuple, loader, postprocess=None, *, timeout: float | None = None):
         """Run ``loader()`` once per key across concurrent callers.
@@ -142,6 +191,9 @@ class _Inflight:
                 flight.waiters += 1
 
         if not leader:
+            # A follower joined an existing flight: count it as a coalesced wait
+            # regardless of whether it later receives the result or the error.
+            self._stats.incr("coalesced_waits")
             # The follower registered itself above; always unregister, whether it
             # wakes normally or times out. A timed-out follower must not leave
             # the flight registered with a stale waiter count — the flight stays

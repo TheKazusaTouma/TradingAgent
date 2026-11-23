@@ -10,7 +10,12 @@ from stockstats import wrap
 
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
-from tradingagents.dataflows.vendors.yahoo.cache import _Inflight, _RangeCache, range_cache_key
+from tradingagents.dataflows.vendors.yahoo.cache import (
+    STATS,
+    _Inflight,
+    _RangeCache,
+    range_cache_key,
+)
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
 
@@ -54,6 +59,8 @@ def get_YFin_data_online(
     key = range_cache_key(canonical, "yahoo", "ohlcv", start_date, end_inclusive)
     now = _now()
     data = None if refresh else _range_cache.get(key, now)
+    if data is not None:
+        STATS.incr("memory_hits")
 
     if data is None:
         # Coalesce concurrent identical misses into one provider load. The
@@ -62,21 +69,32 @@ def get_YFin_data_online(
         def _load() -> pd.DataFrame:
             cached = None if refresh else _range_cache.get(key, _now())
             if cached is not None:
+                # Served from memory inside the flight (the race was lost): a hit.
+                STATS.incr("memory_hits")
                 return cached
-            loaded = yf_retry(
-                lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive)
-            )
+            # One load attempt per shared load, before the provider is invoked,
+            # so yf_retry's internal retries are not counted separately.
+            STATS.incr("load_attempts")
+            try:
+                loaded = yf_retry(
+                    lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive)
+                )
 
-            # Empty result means the symbol is unknown/delisted. Raise a typed
-            # error instead of returning prose: the routing layer turns it into a
-            # single unambiguous "no data" signal so the agent never fabricates a
-            # price.
-            if loaded is None or loaded.empty:
-                raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+                # Empty result means the symbol is unknown/delisted. Raise a typed
+                # error instead of returning prose: the routing layer turns it into a
+                # single unambiguous "no data" signal so the agent never fabricates a
+                # price.
+                if loaded is None or loaded.empty:
+                    raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
 
-            # Store only after the load succeeded; cache.store keeps its own copy.
-            _range_cache.store(key, loaded, _now())
-            return loaded
+                # Store only after the load succeeded; cache.store keeps its own copy.
+                _range_cache.store(key, loaded, _now())
+                return loaded
+            except BaseException:
+                # A shared load failure is counted once (only the leader runs this
+                # loader), not once per waiting caller.
+                STATS.incr("load_failures")
+                raise
 
         data = _range_inflight.run(key, _load)
     # On a hit (cache or shared in-flight) this caller holds an independent copy,

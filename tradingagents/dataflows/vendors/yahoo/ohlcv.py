@@ -8,7 +8,7 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.symbols import normalize_symbol, safe_ticker_component
-from tradingagents.dataflows.vendors.yahoo.cache import _Inflight
+from tradingagents.dataflows.vendors.yahoo.cache import STATS, _Inflight
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 
 logger = logging.getLogger(__name__)
@@ -245,6 +245,7 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
         cached = _read_cached_csv(data_file)
         if cached is not None and _cache_is_fresh(data_file, as_of_dt, now):
             data = cached
+            STATS.incr("disk_hits")
 
     if data is None:
         # Coalesce concurrent cold downloads for this symbol. The loader
@@ -257,33 +258,44 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
             if os.path.exists(data_file):
                 recheck = _read_cached_csv(data_file)
                 if recheck is not None and _cache_is_fresh(data_file, as_of_dt, now):
+                    # Served from disk without a provider call: a disk hit.
+                    STATS.incr("disk_hits")
                     return recheck
 
             # yf.download catches every error, a rate limit included, and returns
             # an empty frame. Ticker.history raises the rate limit, so it is retried.
-            downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
-                start=start_str,
-                end=end_str,
-                auto_adjust=True,
-                actions=False,
-            ))
-            if downloaded is None:
-                raise_for_empty(symbol, canonical, "price rows")
-            downloaded = _ensure_date_column(downloaded.reset_index())
-            # Validate the raw download for storage *before* writing: an empty
-            # frame, a missing Close column, or a frame with no row carrying both
-            # a parseable date and a finite close is not written, so it can never
-            # poison (or overwrite) the cache file. This check is independent of
-            # the caller's as_of_date — it only judges content worth keeping.
-            if downloaded.empty or "Close" not in downloaded.columns:
-                raise_for_empty(symbol, canonical, "price rows")
-            if not _has_usable_bar(downloaded):
-                raise_for_empty(symbol, canonical, "usable price rows")
-            replace_file(
-                data_file,
-                lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"),
-            )
-            return downloaded
+            # A load is counted once here, before the provider is invoked, so
+            # yf_retry's internal retries do not inflate it.
+            STATS.incr("load_attempts")
+            try:
+                downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
+                    start=start_str,
+                    end=end_str,
+                    auto_adjust=True,
+                    actions=False,
+                ))
+                if downloaded is None:
+                    raise_for_empty(symbol, canonical, "price rows")
+                downloaded = _ensure_date_column(downloaded.reset_index())
+                # Validate the raw download for storage *before* writing: an empty
+                # frame, a missing Close column, or a frame with no row carrying both
+                # a parseable date and a finite close is not written, so it can never
+                # poison (or overwrite) the cache file. This check is independent of
+                # the caller's as_of_date — it only judges content worth keeping.
+                if downloaded.empty or "Close" not in downloaded.columns:
+                    raise_for_empty(symbol, canonical, "price rows")
+                if not _has_usable_bar(downloaded):
+                    raise_for_empty(symbol, canonical, "usable price rows")
+                replace_file(
+                    data_file,
+                    lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"),
+                )
+                return downloaded
+            except BaseException:
+                # A shared load failure is counted once (only the leader runs
+                # this loader), never once per waiting caller.
+                STATS.incr("load_failures")
+                raise
 
         data = _ohlcv_inflight.run(inflight_key, _load)
 
