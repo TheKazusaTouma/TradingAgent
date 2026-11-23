@@ -604,12 +604,14 @@ STALE_TRADER_BLANK_REASONING = _rendered_trader(
     # the label itself parses.
     ("investment_plan", STALE_PLAN_RATING_ONLY, "rationale", "missing_field"),
     ("investment_plan", STALE_PLAN_BLANK_NARRATIVE, "rationale", "blank"),
-    ("trader_investment_plan", STALE_TRADER_BAD_PRICE, "entry_price", "invalid_number"),
+    # ADR-002 section 4: an unreadable *optional* numeric is an absence, not a refusal; the
+    # bad-price row now asserts acceptance (see the test below). A blank required narrative
+    # is still refused.
     ("trader_investment_plan", STALE_TRADER_BLANK_REASONING, "reasoning", "blank"),
 ])
 def test_d_stale_saved_payload_is_refused_before_consumption(
         tmp_path, monkeypatch, offline, field, value, expected_field, expected_code):
-    """Every required-field and numeric failure refuses the plan, not only an unknown label."""
+    """Every required-field failure refuses the plan, not only an unknown label."""
     model = AgentModel(structured=True)
     graph = _graph(tmp_path / field.replace("_", ""), monkeypatch, model,
                    agent_contract_mode="validate")
@@ -622,17 +624,38 @@ def test_d_stale_saved_payload_is_refused_before_consumption(
     assert model.calls.get("Portfolio Manager", 0) == 0
 
 
-def test_d_risk_debator_refuses_a_plan_with_an_invalid_price(tmp_path, monkeypatch, offline):
-    """The guard revalidates in full: a usable-looking plan with a bad numeric is refused."""
+def test_d_stale_saved_plan_with_an_unreadable_optional_price_is_accepted(
+        tmp_path, monkeypatch, offline):
+    """ADR-002 section 4 (NS-14): an unreadable optional level does not refuse the plan.
+
+    The plan is revalidated for the Portfolio Manager's own input: its required action and
+    reasoning are present, so the level is simply absent and the agent may run.
+    """
+    model = AgentModel(structured=True)
+    graph = _graph(tmp_path, monkeypatch, model, agent_contract_mode="validate")
+    node = create_portfolio_manager(graph.quick_thinking_llm)
+    node(dict(PM_STATE_OK, trader_investment_plan=STALE_TRADER_BAD_PRICE))
+    assert model.calls.get("Portfolio Manager", 0) == 1
+
+
+def test_d_risk_debator_accepts_a_plan_with_an_unreadable_optional_price(
+        tmp_path, monkeypatch, offline):
+    """The guard revalidates in full; a bad optional level is absence, a blank one is refusal.
+
+    ADR-002 section 4 supersedes the old expectation that the debator refused such a plan.
+    """
     model = AgentModel(structured=True)
     graph = _graph(tmp_path, monkeypatch, model, agent_contract_mode="validate")
     node = create_aggressive_debator(graph.quick_thinking_llm)
+    node(dict(PM_STATE_OK, trader_investment_plan=STALE_TRADER_BAD_PRICE,
+              **dict.fromkeys(("market_report", "sentiment_report", "news_report", "fundamentals_report"), "")))
+    assert model.calls.get("Aggressive Analyst", 0) + model.plain_calls.get("Aggressive Analyst", 0) == 1
+
     with pytest.raises(AgentContractError) as caught:
-        node(dict(PM_STATE_OK, trader_investment_plan=STALE_TRADER_BAD_PRICE,
+        node(dict(PM_STATE_OK, trader_investment_plan=STALE_TRADER_BLANK_REASONING,
                   **dict.fromkeys(("market_report", "sentiment_report", "news_report", "fundamentals_report"), "")))
     assert caught.value.stage == contracts.Stage.INPUT
-    assert "entry_price" in {issue.field for issue in caught.value.issues}
-    assert model.plain_calls.get("Aggressive Analyst", 0) == 0
+    assert ("reasoning", "blank") in {(issue.field, issue.code) for issue in caught.value.issues}
 
 
 def test_d_valid_saved_plans_resume_normally(tmp_path, monkeypatch, offline):
@@ -1226,8 +1249,7 @@ def test_h_trader_rejects_a_rendered_plan_missing_its_narrative_with_zero_calls(
 
 
 @pytest.mark.parametrize("label,factory", DEBATORS, ids=[name for name, _ in DEBATORS])
-@pytest.mark.parametrize("plan", [None, "", "   ", STALE_TRADER_BAD_PRICE], ids=[
-    "none", "empty", "blank", "invalid-price"])
+@pytest.mark.parametrize("plan", [None, "", "   "], ids=["none", "empty", "blank"])
 def test_h_risk_debators_reject_a_required_invalid_plan_with_zero_calls(label, factory, plan):
     llm = _mock_llm(f"{label} argument.")
     node = factory(llm)
@@ -1238,6 +1260,18 @@ def test_h_risk_debators_reject_a_required_invalid_plan_with_zero_calls(label, f
 
     assert caught.value.stage == contracts.Stage.INPUT
     llm.invoke.assert_not_called()
+
+
+@pytest.mark.parametrize("label,factory", DEBATORS, ids=[name for name, _ in DEBATORS])
+def test_h_risk_debators_accept_a_plan_whose_optional_price_is_unreadable(label, factory):
+    """ADR-002 section 4: the bad *optional* level is absent; the plan is still usable."""
+    llm = _mock_llm(f"{label} argument.")
+    node = factory(llm)
+    state = _with_reports(dict(RISK_STATE_OK, trader_investment_plan=STALE_TRADER_BAD_PRICE), "absent")
+
+    node(state)
+
+    llm.invoke.assert_called_once()
 
 
 @pytest.mark.parametrize("label,factory", DEBATORS, ids=[name for name, _ in DEBATORS])

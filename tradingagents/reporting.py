@@ -6,6 +6,7 @@ CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
 run produces the same on-disk report tree a CLI run does.
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -205,4 +206,21 @@ def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict 
         for _agent, filename, _path in agents:
             if (folder, filename) not in current_files:
                 (save_path / folder / filename).unlink(missing_ok=True)
+
+    # The integrity manifest is written last, after the stale-file reconciliation, and lists
+    # exactly the files this save produced -- never the manifest itself and never a file the
+    # caller keeps alongside them (ADR-002 section 5). Paths are handed over as absolute so
+    # the contract is unambiguous even when ``save_path`` is relative to the working directory.
+    from tradingagents.report_integrity import write_manifest
+
+    base = Path(os.path.abspath(save_path))
+    written_files = [base / "complete_report.md"]
+    if html:
+        written_files.append(base / "complete_report.html")
+    written_files.extend(
+        base / folder / filename
+        for _heading, folder, written in parts
+        for _agent, filename, _text in written
+    )
+    write_manifest(base, ticker, written_files)
     return save_path / "complete_report.md"

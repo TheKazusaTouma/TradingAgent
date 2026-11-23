@@ -8,7 +8,7 @@ import os
 # the same way rather than imported.
 AGENT_CONTRACT_MODE_OFF = "off"
 AGENT_CONTRACT_MODES = ("off", "validate", "validate+repair")
-AGENT_CONTRACT_VERSION = "1"
+AGENT_CONTRACT_VERSION = "2"
 
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 
@@ -106,9 +106,13 @@ def build_default_config() -> dict:
     """The built-in defaults with the TRADINGAGENTS_* environment folded in.
 
     Read when the package is imported, as DEFAULT_CONFIG; call it again to see
-    the environment as it is now.
+    the environment as it is now. The merged result is validated by the central
+    preflight (ADR-002 section 3), so a malformed ``TRADINGAGENTS_*`` value is
+    reported before any run starts, naming the variable's config key. The
+    import is local because ``tradingagents.config_validation`` imports this
+    module.
     """
-    return _apply_env_overrides({
+    config = _apply_env_overrides({
         "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR") or os.path.join(_TRADINGAGENTS_HOME, "logs"),
         "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR") or os.path.join(_TRADINGAGENTS_HOME, "cache"),
         "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
@@ -243,6 +247,13 @@ def build_default_config() -> dict:
         },
 
     })
+    # Local import: ``tradingagents.config_validation`` imports this module (ADR-002 section 3).
+    from tradingagents.config_validation import ConfigValidationError, validate_config
+
+    problems = validate_config(config)
+    if problems:
+        raise ConfigValidationError(problems)
+    return config
 
 
 DEFAULT_CONFIG = build_default_config()

@@ -31,6 +31,7 @@ from tradingagents.agents.contracts import (
     end_record_scope,
 )
 from tradingagents.agents.rating import is_review, run_rating
+from tradingagents.config_validation import require_valid_config
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
@@ -117,6 +118,11 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
     selections = get_user_selections(flags)
 
     config = _build_run_config(selections, checkpoint)
+
+    # Preflight before anything else: a bad configuration names every offending parameter and
+    # stops here, before a model is called and before any run directory is created
+    # (ADR-002 section 3, FR-A). The graph repeats the check for callers that bypass the CLI.
+    require_valid_config(config)
 
     stats_handler = StatsCallbackHandler()
 

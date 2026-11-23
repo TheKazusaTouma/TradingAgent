@@ -13,8 +13,11 @@ text, so the contract layer needs one parser that turns that text into the stric
 
 Ambiguity is a failure, not a guess: a duplicated required label, a conflicting repeated
 value, or a required label that is absent, all produce a stable issue code and no payload.
-Numeric labels are read strictly (``contracts.parse_strict_number``) and are never handed to
-the permissive baseline coercer.
+An optional numeric label that cannot be read as one unambiguous number is **not** a
+failure: the field is absent from the payload and one finding records the neutral reason
+(``contracts.SANITIZED_NUMBER_CODE``, ADR-002 section 4). A numeric stated twice with
+different values is reported the same way, with reason ``conflicting_json``: picking one
+would be a guess.
 
 This module deliberately has no dependency on the graph, the CLI or a vendor SDK.
 """
@@ -28,10 +31,14 @@ from typing import Any
 
 from tradingagents.agents.contracts import (
     PORTFOLIO_MANAGER,
+    REASON_CONFLICTING,
+    REASON_OMITTED,
     RESEARCH_MANAGER,
+    SANITIZED_NUMBER_CODE,
     TRADER,
     ContractIssue,
-    parse_strict_number,
+    InvalidNumber,
+    read_optional_number,
 )
 from tradingagents.agents.schemas import PortfolioRating, TraderAction
 
@@ -94,10 +101,16 @@ _BULLET_LABEL = re.compile(r"^[-*+]\s+(?:\*\*|__)?\s*([A-Za-z][A-Za-z /-]*?)\s*(
 
 @dataclass
 class ParsedPlain:
-    """The fields a plain answer stated, plus any finding that makes it unusable."""
+    """The fields a plain answer stated, plus any finding that makes it unusable.
+
+    ``sanitized`` holds one finding per optional numeric the answer stated but that could
+    not be read as a single number. That field is absent in ``values`` (ADR-002 section 4),
+    so it never becomes a failure and never spends another model call.
+    """
 
     values: dict[str, Any] = field(default_factory=dict)
     issues: list[ContractIssue] = field(default_factory=list)
+    sanitized: list[ContractIssue] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -157,6 +170,21 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+_FENCE = re.compile(r"^[ \t]*```[^\n]*\n(.*?)\n?[ \t]*```[ \t]*$", re.DOTALL | re.MULTILINE)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove a fenced code block's banner lines so the content inside is read as the answer.
+
+    A model that answers with ``json`` in a fence still stated the fields; the fence is
+    formatting, not content. A fence that holds a whole answer becomes plain text, and one
+    that holds a JSON object is then found by :func:`_json_object`.
+    """
+    stripped = text.strip()
+    match = _FENCE.fullmatch(stripped)
+    return match.group(1).strip() if match else stripped
+
+
 def _first_braced_object(text: str) -> str | None:
     start = text.find("{")
     end = text.rfind("}")
@@ -195,11 +223,15 @@ def _sections(text: str) -> list[tuple[str, str]]:
 
 
 def _enum_value(raw: str, allowed: set[str]) -> tuple[str | None, str | None]:
-    cleaned = raw.strip().strip("*_`").strip()
-    cleaned = cleaned.split()[0].rstrip(".,;:") if cleaned.split() else ""
-    for value in allowed:
-        if cleaned.lower() == value.lower():
-            return value, None
+    text = raw.strip()
+    # Try the whole statement first (``Hold (no action)`` is still a Hold), then its first
+    # token (``Buy, adding 5%``). Neither is a guess: only an exact, case-insensitive match
+    # against an allowed label succeeds, and anything else is reported unchanged.
+    for candidate in (text, text.split()[0] if text.split() else ""):
+        cleaned = candidate.strip().strip("*_`").strip().rstrip(".,;:()")
+        for value in allowed:
+            if cleaned.lower() == value.lower():
+                return value, None
     return None, "not one of the allowed values"
 
 
@@ -212,6 +244,7 @@ def parse_plain_output(agent: str, message: Any) -> ParsedPlain:
     text, issues = unwrap_content(message)
     if text is None:
         return ParsedPlain(issues=issues)
+    text = _strip_code_fences(text)
     labels = _LABELS[agent]
 
     payload = _json_object(text)
@@ -227,8 +260,14 @@ def parse_plain_output(agent: str, message: Any) -> ParsedPlain:
                 break
 
     values: dict[str, Any] = {}
+    sanitized: list[ContractIssue] = []
     for field_name, bodies in found.items():
         distinct = {body.strip() for body in bodies}
+        if len(distinct) > 1 and field_name in _NUMERIC_FIELDS[agent]:
+            # A level stated twice with different values cannot be resolved without picking
+            # one, so the field is absent and the reason is recorded (ADR-002 section 4).
+            sanitized.append(ContractIssue(SANITIZED_NUMBER_CODE, field_name, REASON_CONFLICTING))
+            continue
         if len(distinct) > 1:
             issues.append(ContractIssue("duplicate_field", field_name,
                                         "the answer states this field more than once with different values"))
@@ -241,13 +280,12 @@ def parse_plain_output(agent: str, message: Any) -> ParsedPlain:
             else:
                 values[field_name] = value
         elif field_name in _NUMERIC_FIELDS[agent]:
-            if body.strip().lower() in _ABSENT_LEVELS:
-                values[field_name] = None
-                continue
-            try:
-                values[field_name] = parse_strict_number(body, field_name)
-            except ValueError as exc:
-                issues.append(ContractIssue("invalid_number", field_name, str(exc)))
+            number, reason = read_optional_number(body)
+            if reason is None:
+                values[field_name] = number
+            elif reason != REASON_OMITTED:
+                values[field_name] = InvalidNumber(body, reason)
+                sanitized.append(ContractIssue(SANITIZED_NUMBER_CODE, field_name, reason))
         else:
             values[field_name] = body
 
@@ -256,7 +294,7 @@ def parse_plain_output(agent: str, message: Any) -> ParsedPlain:
         if field_name not in values and field_name not in found:
             issues.append(ContractIssue("missing_field", field_name,
                                         "the answer does not state this required field"))
-    return ParsedPlain(values=values, issues=issues)
+    return ParsedPlain(values=values, issues=issues, sanitized=sanitized)
 
 
 def _required_fields(agent: str) -> tuple[str, ...]:
@@ -277,18 +315,18 @@ def _from_mapping(agent: str, payload: dict[str, Any]) -> ParsedPlain:
     known = set(_TEXT_FIELDS[agent]) | set(_NUMERIC_FIELDS[agent]) | {_enum_field(agent)}
     values: dict[str, Any] = {}
     issues: list[ContractIssue] = []
+    sanitized: list[ContractIssue] = []
     for name in known:
         if name not in payload:
             continue
         raw = payload[name]
         if name in _NUMERIC_FIELDS[agent]:
-            if raw is None:
-                values[name] = None
-                continue
-            try:
-                values[name] = parse_strict_number(raw, name)
-            except ValueError as exc:
-                issues.append(ContractIssue("invalid_number", name, str(exc)))
+            number, reason = read_optional_number(raw)
+            if reason is None:
+                values[name] = number
+            elif reason != REASON_OMITTED:
+                values[name] = InvalidNumber(raw, reason)
+                sanitized.append(ContractIssue(SANITIZED_NUMBER_CODE, name, reason))
         elif name == _enum_field(agent):
             if not isinstance(raw, str):
                 issues.append(ContractIssue("invalid_enum", name, "not one of the allowed values"))
@@ -300,4 +338,4 @@ def _from_mapping(agent: str, payload: dict[str, Any]) -> ParsedPlain:
                 values[name] = value
         else:
             values[name] = raw
-    return ParsedPlain(values=values, issues=issues)
+    return ParsedPlain(values=values, issues=issues, sanitized=sanitized)

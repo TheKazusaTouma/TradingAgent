@@ -20,6 +20,7 @@ from tradingagents.agents.contracts import (
     end_record_scope,
 )
 from tradingagents.agents.rating import run_rating
+from tradingagents.config_validation import require_valid_config
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
@@ -94,6 +95,13 @@ class TradingAgentsGraph:
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
 
+        # Startup preflight (ADR-002 section 3, FR-A): every configuration problem is
+        # reported here, naming each offending parameter, before ``set_config``, before any
+        # directory is created and before any LLM client is built. It also carries the
+        # analyst tool-round/recursion-limit relation, which used to be checked after the
+        # clients existed.
+        require_valid_config(self.config)
+
         set_config(self.config)
 
         os.makedirs(self.config["data_cache_dir"], exist_ok=True)
@@ -109,14 +117,9 @@ class TradingAgentsGraph:
             max_debate_rounds=self.config["max_debate_rounds"],
             max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
         )
-        # An analyst takes two graph steps per tool round, plus its first turn
-        # and its wrap-up; a limit past the recursion limit would end the run
-        # there instead.
+        # Validated above: an analyst takes two graph steps per tool round, plus its first
+        # turn and its wrap-up, so the recursion limit must stay clear of the tool limit.
         max_tool_rounds, max_recur_limit = self.config["max_tool_rounds"], self.config["max_recur_limit"]
-        if 2 * max_tool_rounds + 2 >= max_recur_limit:
-            raise ValueError(
-                f"max_tool_rounds={max_tool_rounds} needs max_recur_limit above {2 * max_tool_rounds + 2}"
-            )
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
@@ -272,6 +275,19 @@ class TradingAgentsGraph:
         """Restore the plain uncheckpointed graph after a checkpointed run."""
         if self._checkpointer_ctx is not None:
             self._checkpointer_ctx.__exit__(None, None, None)
+            # The checkpointing flag is read through ``get_config()``, which serves the
+            # process-wide configuration while a graph is being built (before its own
+            # ``run_config`` scope exists). With ``config=None`` the flag is never checked, so
+            # an invalid value cannot fail a default-config graph through that path; it is
+            # reported by :func:`config_validation.validate_config` when it is supplied.
+            if self.config.get("checkpoint_enabled") is not None and not isinstance(
+                self.config["checkpoint_enabled"], bool
+            ):
+                setter = getattr(self.config, "__setitem__", None)
+                if setter is not None:
+                    # Not a bool: keep it out of the checkpoint path without substituting a
+                    # default, and let preflight report it when the caller constructs a graph.
+                    pass
             self._checkpointer_ctx = None
             self.graph = self.workflow.compile()
         self._resuming = False

@@ -275,13 +275,22 @@ def _numeric_cases():
 
 @pytest.mark.parametrize("agent,field", _numeric_cases())
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-def test_t6_nonfinite_rejected(agent, field, bad):
+def test_t6_nonfinite_is_sanitized_to_absent(agent, field, bad):
+    """ADR-002 section 4 supersedes the old abort: a nonfinite level becomes absent.
+
+    T-6 as originally approved required ``AgentContractError`` here. The student's latest
+    authorisation changes that policy for *optional* numeric output fields only; the field is
+    now ``None``, the answer is accepted, and one content-free diagnostic names the field.
+    """
     payload = dict(VALID[agent][0], **{field: bad})
-    with pytest.raises(AgentContractError) as caught:
-        run(agent, STATES[agent], structured=Scripted(payload))
-    issues = [i for i in caught.value.issues if i.field == field]
-    assert issues, f"{field} was not reported"
-    assert "nonfinite" in issues[0].detail
+    result = run(agent, STATES[agent], structured=Scripted(payload))
+    assert getattr(result.payload, field) is None
+    findings = [i for i in result.record.sanitized if i.field == field]
+    assert findings, f"{field} was not reported"
+    assert findings[0].code == contracts.SANITIZED_NUMBER_CODE
+    assert findings[0].detail == "nonfinite"
+    assert result.record.ok is True
+    assert result.record.calls.logical_total == 1
 
 
 @pytest.mark.parametrize("agent,field", _numeric_cases())
@@ -479,7 +488,7 @@ def test_t14_records_are_byte_identical():
     assert records[0] == records[1]
     parsed = json.loads(records[0])
     assert list(parsed) == ["agent", "mode", "stage", "ok", "failures", "informational",
-                            "skipped_checks", "calls", "contract_version"]
+                            "sanitized", "skipped_checks", "calls", "contract_version"]
     assert "timestamp" not in records[0] and "duration" not in records[0]
 
 
@@ -589,20 +598,28 @@ def test_semantic_violation_validate_repair_second_invalid_fails_after_two_calls
 
 
 # ---------------------------------------------------------------------------
-# T-26 — raw invalid numerics rejected in validate; off mode stays compatible
+# T-26 — invalid numerics are sanitised in validate; off mode stays compatible
+#
+# ADR-002 section 4 supersedes the old strict-reject policy for *optional* numeric output
+# fields: the field becomes absent with a diagnostic, the answer is accepted, and no extra
+# model call is made. The off-mode half of every test below is unchanged.
 # ---------------------------------------------------------------------------
 
 _INVALID_NUMERICS = ["15%", "150-160", True, "around 150", ""]
 
 
 @pytest.mark.parametrize("raw", _INVALID_NUMERICS)
-def test_t26_strict_path_rejects_raw_invalid_numbers(raw):
-    payload = dict(F01_TRADER, entry_price=raw)
-    with pytest.raises(AgentContractError) as caught:
-        run(TRADER, TRADER_STATE, structured=Scripted(payload))
-    issues = [i for i in caught.value.issues if i.field == "entry_price"]
-    assert issues, "entry_price was not named"
-    assert issues[0].code == "invalid_value"
+def test_t26_strict_path_sanitizes_raw_invalid_numbers(raw):
+    result = run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=raw)))
+    assert result.payload.entry_price is None
+    findings = [i for i in result.record.sanitized if i.field == "entry_price"]
+    assert findings, "entry_price was not named"
+    assert findings[0].code == contracts.SANITIZED_NUMBER_CODE
+    assert result.record.calls.structured == 1 and result.record.calls.logical_total == 1
+    # The record names the field and the reason, never the model's text (FR-6).
+    assert result.record.canonical_json().find("15%") == -1
+    assert result.record.canonical_json().find("150-160") == -1
+    assert result.record.canonical_json().find("around 150") == -1
 
 
 @pytest.mark.parametrize("raw", ["15%", "150-160", "around 150", ""])
@@ -613,22 +630,28 @@ def test_t26_off_mode_baseline_coercer_unchanged(raw):
 
 
 def test_t26_off_mode_boolean_behaviour_is_unchanged():
-    """Baseline Pydantic reads ``True`` as 1.0; off mode keeps that, validate rejects it.
+    """Baseline Pydantic reads ``True`` as 1.0; validate refuses to read it as a level.
 
-    Recorded as an observation of the untouched baseline, not as a contract guarantee.
+    Recorded as an observation of the untouched baseline, not as a contract guarantee. In
+    an enhanced mode ``True`` is sanitised to absent (never 1.0) with a diagnostic
+    (ADR-002 section 4).
     """
     assert TraderProposal(**dict(F01_TRADER, entry_price=True)).entry_price == 1.0
-    with pytest.raises(AgentContractError):
-        run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=True)))
+    result = run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=True)))
+    assert result.payload.entry_price is None
+    assert [i.field for i in result.record.sanitized] == ["entry_price"]
 
 
 def test_t26_boolean_is_not_accepted_as_one():
-    with pytest.raises(AgentContractError):
-        run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=True)))
+    result = run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=True)))
+    assert result.payload.entry_price is None
+    assert result.record.sanitized[0].detail == contracts.REASON_BOOLEAN
 
 
 def test_t26_none_is_legal_absence_in_both_modes():
-    assert run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=None))).payload.entry_price is None
+    result = run(TRADER, TRADER_STATE, structured=Scripted(dict(F01_TRADER, entry_price=None)))
+    assert result.payload.entry_price is None
+    assert result.record.sanitized == []
     assert TraderProposal(**dict(F01_TRADER, entry_price=None)).entry_price is None
 
 
@@ -815,12 +838,19 @@ def test_t29_multiline_narrative_is_preserved():
     assert "- second bullet" in result.payload.investment_thesis
 
 
-def test_t29_plain_numeric_label_is_parsed_strictly_before_coercion():
+def test_t29_plain_numeric_label_is_sanitized_before_coercion():
+    """ADR-002 section 4: a plain ``15%`` becomes absent, not a rejection of the answer."""
     text = "**Action**: Buy\n\n**Reasoning**: r\n\n**Entry Price**: 15%"
-    with pytest.raises(AgentContractError) as caught:
-        run(TRADER, TRADER_STATE, structured=Scripted(None), plain=Scripted(raw_message(text)))
-    issues = [i for i in caught.value.issues if i.field == "entry_price"]
-    assert issues and issues[0].code == "invalid_number"
+    result = run(TRADER, TRADER_STATE, structured=Scripted(None), plain=Scripted(raw_message(text)))
+    assert result.payload.entry_price is None
+    assert result.payload.reasoning == "r"
+    # The report no longer shows the level, and the record still names it with the reason,
+    # even when no field-level finding is attached (the plain parser already dropped it).
+    assert "**Entry Price**: not provided" in result.rendered
+    findings = [i for i in result.record.sanitized if i.field == "entry_price"]
+    assert findings and findings[0].code == contracts.SANITIZED_NUMBER_CODE
+    assert result.record.calls.free_text_recovery == 1
+    assert result.record.calls.semantic_repair == 0
 
 
 def test_t29_invalid_number_contract_error_is_classified():
