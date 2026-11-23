@@ -9,7 +9,7 @@ Subsequent packaging changes affect documentation only.
 - Feature branch: `feat/agent-io-validation`; existing PR: #4.
 - Integrated team main `307d15ea83b8d4fb85cb3116e1963e323dc060d9` into this feature branch.
 - `tradingagents/memory/log.py` and `tests/test_memory_log.py` match that main commit exactly.
-- No dependency, CI workflow, main-branch or other contributor branch changes are included.
+- No runtime dependency, CI workflow, main-branch or other contributor branch changes are included.
 - Local approval records, full OpenCode transcripts and raw verification logs are retained
   separately rather than published in this PR. Historical references to them in the design
   documents refer to local development, not team approval.
@@ -60,3 +60,12 @@ load environment settings; credentials were not intentionally inspected or print
 - Preflight and report manifests are active in every contract mode.
 - GitHub checks are reported by GitHub separately; these local results do not claim a
   successful hosted CI run or branch protection.
+
+## Hosted CI dependency correction
+
+The initial hosted run failed during collection because the new schema tests import
+`jsonschema` but the existing dev extra did not declare it. OpenCode added
+`jsonschema>=4.18` to `project.optional-dependencies.dev`. The runtime dependency list,
+test assertions and CI workflow are unchanged. The local environment already contained
+this test tool, which is why the original offline run did not expose the packaging defect.
+The hosted checks are rerun after this correction; their current status is shown on PR #4.
