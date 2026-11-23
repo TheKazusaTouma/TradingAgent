@@ -17,6 +17,7 @@ from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
+from tradingagents.observability import TraceSession
 from tradingagents.reporting import write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -113,6 +114,9 @@ class TradingAgentsGraph:
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
         self._resuming = False
+        # The trace id of the most recent propagate() attempt, for programmatic
+        # callers; None until a traced run has started.
+        self.last_trace_id: str | None = None
 
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock",
                                    trade_date: str | None = None) -> str:
@@ -182,11 +186,18 @@ class TradingAgentsGraph:
         """
         trade_date = _validate_trade_date(trade_date)
 
-        with run_config(self.config), \
+        session = TraceSession(self.config["results_dir"], company_name, trade_date)
+        self.last_trace_id = session.trace_id
+        # Trace the whole attempt: run_start precedes checkpoint setup and
+        # create_run_state, so a failure in either still leaves run_start + a
+        # run_fail and nothing is reported as a clean end. trace_scope serves the
+        # id to current_trace_id() for the block and resets it on exit.
+        with session.run(company_of_interest=company_name, trade_date=str(trade_date)), \
+                run_config(self.config), \
                 self.checkpoint_scope(company_name, trade_date, asset_type, portfolio) as thread_id_value:
             return self._run_graph(
                 company_name, trade_date, asset_type=asset_type,
-                checkpoint_thread_id=thread_id_value, portfolio=portfolio,
+                checkpoint_thread_id=thread_id_value, portfolio=portfolio, trace=session,
             )
 
     def begin_checkpoint(self, company_name, trade_date, asset_type: str = "stock", portfolio=None) -> str | None:
@@ -371,7 +382,7 @@ class TradingAgentsGraph:
         )
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   checkpoint_thread_id: str | None = None, portfolio=None):
+                   checkpoint_thread_id: str | None = None, portfolio=None, trace=None):
         """Execute the graph and write the resulting state to disk and memory log."""
         init_agent_state = self.create_run_state(company_name, trade_date, asset_type, portfolio)
         args = self.propagator.get_graph_args()
@@ -380,6 +391,16 @@ class TradingAgentsGraph:
         # ticker+date+graph-shape resumes; a different one starts fresh (#1089).
         if checkpoint_thread_id is not None:
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = checkpoint_thread_id
+
+        # Trace this attempt: add its handler to the graph config (so model and
+        # tool callbacks both see it) and carry the id in metadata. Per-run, so a
+        # reused graph object never keeps a previous run's handler (#trace).
+        # The run_start/run_end/run_fail events are emitted by the caller's
+        # TraceSession.run() around this method, so a failure before the graph
+        # (checkpoint setup, create_run_state) is traced too.
+        if trace is not None:
+            args.setdefault("config", {}).setdefault("callbacks", []).append(trace.callback_handler())
+            args["config"].setdefault("metadata", {}).update(trace.config_metadata())
 
         # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
         graph_input = self.checkpoint_input(init_agent_state)
