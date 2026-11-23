@@ -1,8 +1,10 @@
 # User Guide — Startup Preflight, Numeric Sanitation and Report Integrity
 
+PR packaging note: approval records and full OpenCode transcripts refer to local development and are retained separately. They are excluded from this PR. Team review and merge approval are still pending. See docs/verification/increment-v3-evidence.md for integration verification.
+
 This guide describes the three capabilities added in increment v3. It is written for someone
 running the tool, not for a reviewer of the change. Every example below is copied from a real
-run on this repository (`Windows 11`, `Python` from `.venv`, no network, no provider key);
+run on this repository (`Windows 11`, `Python` from `.venv`, offline verification without live provider requests);
 nothing here is illustrative-only.
 
 Design and approval records: `docs/architecture/adr/002-preflight-sanitation-manifest.md`,

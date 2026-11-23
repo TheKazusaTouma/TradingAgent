@@ -1,5 +1,7 @@
 # Increment v3 Test Specification — Preflight, Numeric Sanitation, Report Integrity
 
+PR packaging note: approval records and full OpenCode transcripts refer to local development and are retained separately. They are excluded from this PR. Team review and merge approval are still pending. See docs/verification/increment-v3-evidence.md for integration verification.
+
 - Version: **3.0** (concrete, implementation-independent expectations)
 - Status: **Specification approved for implementation by the student's latest authorisation**
   (`docs/approvals/agent-contract-v3.md`). Rows in §7 are filled only from real command
