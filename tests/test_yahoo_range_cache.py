@@ -8,6 +8,7 @@ and the small ``cache._RangeCache`` it uses.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -33,6 +34,9 @@ EXPECTED_CACHE_OFF = (
     "2026-01-05,101.00,111.00,91.00,106.00,2000,0.0,0.0\n"
     "2026-01-06,102.00,112.00,92.00,107.50,3000,0.0,0.0\n"
 )
+# The hand-written header uses LF; pandas writes CSV with the platform newline.
+_header, _csv = EXPECTED_CACHE_OFF.split("\n\n", 1)
+EXPECTED_CACHE_OFF = _header + "\n\n" + _csv.replace("\n", os.linesep)
 
 
 def _frame(rows, *, open0=100.0, close0=105.0):
