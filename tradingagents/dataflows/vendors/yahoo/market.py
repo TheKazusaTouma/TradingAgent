@@ -1,7 +1,9 @@
 import logging
+import time
 from datetime import datetime
 from typing import Annotated
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
@@ -9,16 +11,40 @@ from stockstats import wrap
 
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
+from tradingagents.dataflows.vendors.yahoo.cache import (
+    STATS,
+    _Inflight,
+    _RangeCache,
+    range_cache_key,
+)
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
-from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
+from tradingagents.dataflows.vendors.yahoo.ohlcv import (
+    _assert_range_usable_and_fresh,
+    load_ohlcv,
+)
 
 logger = logging.getLogger(__name__)
+
+# One process-local cache for date-range downloads. Raw frames are keyed by the
+# normalized request identity so a repeated query within the TTL reuses one
+# provider load; a failed load is never stored.
+_range_cache = _RangeCache()
+
+# Concurrent identical misses share one provider load instead of each issuing
+# their own download.
+_range_inflight = _Inflight()
+
+
+def _now() -> float:
+    """Monotonic clock for cache freshness (patched by tests with a fake clock)."""
+    return time.monotonic()
 
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    refresh: bool = False,
 ):
 
     datetime.strptime(start_date, "%Y-%m-%d")
@@ -31,22 +57,78 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
 
-    # Empty result means the symbol is unknown/delisted. Raise a typed error
-    # instead of returning prose: the routing layer turns it into a single
-    # unambiguous "no data" signal so the agent never fabricates a price.
-    if data is None or data.empty:
-        raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+    # Reuse a raw download for an identical request within its TTL. ``refresh``
+    # bypasses the old entry and a successful load re-populates it.
+    key = range_cache_key(canonical, "yahoo", "ohlcv", start_date, end_inclusive)
+    now = _now()
+    data = None if refresh else _range_cache.get(key, now)
+    if data is not None:
+        STATS.incr("memory_hits")
+
+    if data is None:
+        # Coalesce concurrent identical misses into one provider load. The
+        # loader rechecks the cache first, so a request that loses the race but
+        # arrives after another already stored the frame is served from it.
+        # A forced caller joining a recheck-only flight is pushed back through
+        # this same loading path (see _Inflight.run's require_fresh) so it still
+        # obtains provider data without a separate refresh namespace.
+        def _load() -> tuple[pd.DataFrame, bool]:
+            cached = None if refresh else _range_cache.get(key, _now())
+            if cached is not None:
+                # Served from memory inside the flight (the race was lost): a hit.
+                STATS.incr("memory_hits")
+                return cached, False
+            # One load attempt per shared load, before the provider is invoked,
+            # so yf_retry's internal retries are not counted separately.
+            STATS.incr("load_attempts")
+            try:
+                loaded = yf_retry(
+                    lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive)
+                )
+
+                # Empty result means the symbol is unknown/delisted. Raise a typed
+                # error instead of returning prose: the routing layer turns it into a
+                # single unambiguous "no data" signal so the agent never fabricates a
+                # price.
+                if loaded is None or loaded.empty:
+                    raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
+
+                # Validate the raw download BEFORE storing it or handing it to the
+                # waiting callers: a stale frame, or one with no usable finite close,
+                # must never enter the success cache or a shared result.
+                _assert_range_usable_and_fresh(loaded, end_date, symbol, canonical)
+
+                # Store only after the load succeeded and validated; cache.store
+                # keeps its own copy.
+                _range_cache.store(key, loaded, _now())
+                return loaded, True
+            except BaseException:
+                # A shared load failure is counted once (only the leader runs this
+                # loader), not once per waiting caller.
+                STATS.incr("load_failures")
+                raise
+
+        data = _range_inflight.run(key, _load, require_fresh=refresh)
+    # On a hit (cache or shared in-flight) this caller holds an independent copy,
+    # so ``data`` is safe to format in place below.
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
 
-    # Reject a stale frame (e.g. a year-old partial response) before it is
-    # formatted into the report. Raises NoMarketDataError, which the router
-    # turns into one clear unavailable signal (#1021).
-    _assert_ohlcv_not_stale(data, end_date, symbol, canonical)
+    # Coerce non-finite closes (±inf) to missing so they render as empty rather
+    # than "inf" in the CSV. The date index and column layout are untouched, and
+    # no OHLCV-only transformation (row dropping, column renames) is applied.
+    for col in ("Open", "High", "Low", "Close", "Adj Close"):
+        if col in data.columns:
+            numeric = pd.to_numeric(data[col], errors="coerce").astype("float64")
+            data[col] = numeric.where(np.isfinite(numeric))
+
+    # Defense in depth for the warm (cache-hit) path too: reject a frame with no
+    # usable finite close, or one whose latest usable row is stale, before
+    # formatting. Fresh loads were already validated before being stored.
+    _assert_range_usable_and_fresh(data, end_date, symbol, canonical)
 
     for col in ("Open", "High", "Low", "Close", "Adj Close"):
         if col in data.columns:
