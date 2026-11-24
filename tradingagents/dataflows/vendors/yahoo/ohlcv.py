@@ -1,6 +1,7 @@
 import logging
 import os
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -8,9 +9,15 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.symbols import normalize_symbol, safe_ticker_component
+from tradingagents.dataflows.vendors.yahoo.cache import STATS, _Inflight
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 
 logger = logging.getLogger(__name__)
+
+# Concurrent cold downloads for the same (cache dir, symbol) share one provider
+# call; the raw five-year frame is what is shared, while each caller still
+# applies its own date cutoff and gap handling afterwards.
+_ohlcv_inflight = _Inflight()
 
 # A vendor's latest OHLCV row this many calendar days before the requested date
 # is treated as stale. Generous enough to span long holiday weekends, tight
@@ -76,6 +83,11 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
 
     price_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
     data[price_cols] = data[price_cols].apply(pd.to_numeric, errors="coerce")
+    # Treat ±inf as a missing price, like NaN: an infinite close is not a usable
+    # value and must never reach callers. Downstream dropna/fill then handle it
+    # exactly as any other gap in both fill_gaps modes.
+    if "Close" in data.columns:
+        data.loc[~np.isfinite(data["Close"]), "Close"] = np.nan
     return data
 
 
@@ -104,6 +116,81 @@ def _coerce_ohlcv_dates(data: pd.DataFrame) -> pd.Series:
             if not parsed.empty:
                 return parsed
     return pd.Series(dtype="datetime64[ns]")
+
+
+def _row_aligned_dates_and_closes(data: pd.DataFrame):
+    """Row-aligned (normalized dates, numeric closes) for a frame, or ``None``.
+
+    The date may be a ``Date``/``Datetime``/``date`` column (the cached CSV and a
+    reset-index download) or a ``DatetimeIndex`` (a raw yfinance ``history()``
+    frame, which the date-range path passes straight through). Aligning dates and
+    closes by position keeps the per-row check correct in both shapes. Returns
+    ``None`` when the frame has no Close or no date source.
+    """
+    if data is None or data.empty or "Close" not in data.columns:
+        return None
+    frame = _ensure_date_column(data)
+    if "Date" in frame.columns:
+        raw_dates = frame["Date"].reset_index(drop=True)
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        raw_dates = pd.Series(frame.index).reset_index(drop=True)
+    else:
+        return None
+    dates = _normalize_dates(raw_dates).reset_index(drop=True)
+    closes = pd.to_numeric(frame["Close"], errors="coerce").astype("float64").reset_index(drop=True)
+    return dates, closes
+
+
+def _has_usable_bar(data: pd.DataFrame) -> bool:
+    """Whether a frame holds at least one row with both a parseable date and a
+    finite numeric close.
+
+    Validation is done on normalized dates and coerced numerics, aligned by row,
+    so a frame whose valid date and valid close fall on *different* rows has no
+    usable bar. This is independent of the caller's ``as_of_date``: it decides
+    only whether the content is worth storing/serving, not whether it covers a
+    particular date.
+    """
+    aligned = _row_aligned_dates_and_closes(data)
+    if aligned is None:
+        return False
+    dates, closes = aligned
+    # A finite close only: ±inf and NaN are not usable prices.
+    usable = dates.notna() & np.isfinite(closes)
+    return bool(usable.any())
+
+
+def _latest_usable_date(data: pd.DataFrame):
+    """The latest date whose row carries both a parseable date and a finite close.
+
+    Used to judge freshness on real, usable data: a recent row whose close is
+    ±inf is not a real latest quote, so the newest finite bar decides staleness.
+    Returns a normalised ``pd.Timestamp`` or ``pd.NaT`` when no usable row exists.
+    """
+    aligned = _row_aligned_dates_and_closes(data)
+    if aligned is None:
+        return pd.NaT
+    dates, closes = aligned
+    usable = dates.notna() & np.isfinite(closes)
+    if not usable.any():
+        return pd.NaT
+    return dates[usable].max().normalize()
+
+
+def _read_cached_csv(data_file: str):
+    """Read a cached CSV, treating unreadable or unusable content as a miss.
+
+    A zero-byte, malformed, or contentless cache (e.g. a symbol with a ``Close``
+    column but no row carrying both a date and a close) is not usable; return
+    ``None`` so the caller refetches rather than crashing or serving it.
+    """
+    try:
+        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError):
+        return None
+    if cached.empty or "Close" not in cached.columns or not _has_usable_bar(cached):
+        return None
+    return cached
 
 
 def _assert_ohlcv_not_stale(
@@ -139,6 +226,52 @@ def _assert_ohlcv_not_stale(
             symbol,
             canonical,
             f"latest row is {latest.date()}, {stale_days} days before the "
+            f"requested {requested.date()} (stale) — refusing to use it",
+        )
+
+
+def _assert_range_usable_and_fresh(
+    data: pd.DataFrame,
+    end_date: str,
+    symbol: str,
+    canonical: str | None = None,
+    *,
+    max_stale_days: int = MAX_OHLCV_STALE_DAYS,
+) -> None:
+    """Validate a date-range download before it is stored or returned.
+
+    The frame is usable only if it holds at least one row with both a parseable
+    date and a finite close, and its latest *usable* row (finite close) is within
+    ``max_stale_days`` of ``end_date``. A recent row whose close is ±inf does not
+    count as the latest quote, so an old finite bar behind an infinite tail is
+    still judged stale. Raises ``NoMarketDataError`` otherwise so the caller never
+    caches or serves an unusable/old frame. This performs no output transformation
+    (no column renames, no row dropping); it only inspects the frame.
+    """
+    if data is None or data.empty:
+        raise NoMarketDataError(
+            symbol, canonical, f"no rows between {end_date} and {end_date}"
+        )
+    if not _has_usable_bar(data):
+        raise NoMarketDataError(
+            symbol, canonical,
+            f"no usable closing prices between {end_date} and {end_date}",
+        )
+    requested = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(requested):
+        return
+    latest = _latest_usable_date(data)
+    if pd.isna(latest):
+        raise NoMarketDataError(
+            symbol, canonical,
+            f"no usable closing prices between {end_date} and {end_date}",
+        )
+    stale_days = (requested.normalize() - latest).days
+    if stale_days > max_stale_days:
+        raise NoMarketDataError(
+            symbol,
+            canonical,
+            f"latest usable row is {latest.date()}, {stale_days} days before the "
             f"requested {requested.date()} (stale) — refusing to use it",
         )
 
@@ -193,36 +326,68 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
         f"{safe_symbol}-YFin-data.csv",
     )
 
-    # A cached file may be empty if a prior fetch failed (unknown symbol,
-    # transient rate limit). Treat an empty/columnless cache as a miss and
-    # re-fetch rather than serving the poisoned file forever.
+    # A cached file may be empty or malformed if a prior fetch failed (unknown
+    # symbol, transient rate limit) or was corrupted on disk. Treat unreadable
+    # or unusable content as a miss and re-fetch rather than crashing or serving
+    # the poisoned file forever.
     data = None
     if os.path.exists(data_file):
-        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
-        if (
-            not cached.empty
-            and "Close" in cached.columns
-            and _cache_is_fresh(data_file, as_of_dt, now)
-        ):
+        cached = _read_cached_csv(data_file)
+        if cached is not None and _cache_is_fresh(data_file, as_of_dt, now):
             data = cached
+            STATS.incr("disk_hits")
 
     if data is None:
-        # yf.download catches every error, a rate limit included, and returns
-        # an empty frame. Ticker.history raises the rate limit, so it is retried.
-        downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
-            start=start_str,
-            end=end_str,
-            auto_adjust=True,
-            actions=False,
-        ))
-        if downloaded is None:
-            raise_for_empty(symbol, canonical, "price rows")
-        downloaded = _ensure_date_column(downloaded.reset_index())
-        # Only cache real data — never persist an empty frame.
-        if downloaded.empty or "Close" not in downloaded.columns:
-            raise_for_empty(symbol, canonical, "price rows")
-        replace_file(data_file, lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"))
-        data = downloaded
+        # Coalesce concurrent cold downloads for this symbol. The loader
+        # rechecks the on-disk file first: a request that joins an in-flight
+        # load started for another date may now find a freshly written file it
+        # can serve from, avoiding a second download.
+        inflight_key = (os.path.abspath(config["data_cache_dir"]), safe_symbol)
+
+        def _load() -> tuple[pd.DataFrame, bool]:
+            if os.path.exists(data_file):
+                recheck = _read_cached_csv(data_file)
+                if recheck is not None and _cache_is_fresh(data_file, as_of_dt, now):
+                    # Served from disk without a provider call: a disk hit.
+                    STATS.incr("disk_hits")
+                    return recheck, False
+
+            # yf.download catches every error, a rate limit included, and returns
+            # an empty frame. Ticker.history raises the rate limit, so it is retried.
+            # A load is counted once here, before the provider is invoked, so
+            # yf_retry's internal retries do not inflate it.
+            STATS.incr("load_attempts")
+            try:
+                downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
+                    start=start_str,
+                    end=end_str,
+                    auto_adjust=True,
+                    actions=False,
+                ))
+                if downloaded is None:
+                    raise_for_empty(symbol, canonical, "price rows")
+                downloaded = _ensure_date_column(downloaded.reset_index())
+                # Validate the raw download for storage *before* writing: an empty
+                # frame, a missing Close column, or a frame with no row carrying both
+                # a parseable date and a finite close is not written, so it can never
+                # poison (or overwrite) the cache file. This check is independent of
+                # the caller's as_of_date — it only judges content worth keeping.
+                if downloaded.empty or "Close" not in downloaded.columns:
+                    raise_for_empty(symbol, canonical, "price rows")
+                if not _has_usable_bar(downloaded):
+                    raise_for_empty(symbol, canonical, "usable price rows")
+                replace_file(
+                    data_file,
+                    lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"),
+                )
+                return downloaded, True
+            except BaseException:
+                # A shared load failure is counted once (only the leader runs
+                # this loader), never once per waiting caller.
+                STATS.incr("load_failures")
+                raise
+
+        data = _ohlcv_inflight.run(inflight_key, _load)
 
     data = _clean_dataframe(data)
 
