@@ -1,6 +1,7 @@
 import logging
 import os
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -82,6 +83,11 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
 
     price_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in data.columns]
     data[price_cols] = data[price_cols].apply(pd.to_numeric, errors="coerce")
+    # Treat ±inf as a missing price, like NaN: an infinite close is not a usable
+    # value and must never reach callers. Downstream dropna/fill then handle it
+    # exactly as any other gap in both fill_gaps modes.
+    if "Close" in data.columns:
+        data.loc[~np.isfinite(data["Close"]), "Close"] = np.nan
     return data
 
 
@@ -128,8 +134,9 @@ def _has_usable_bar(data: pd.DataFrame) -> bool:
     if "Date" not in frame.columns:
         return False
     dates = _normalize_dates(frame["Date"])
-    closes = pd.to_numeric(frame["Close"], errors="coerce")
-    usable = dates.notna() & closes.notna()
+    closes = pd.to_numeric(frame["Close"], errors="coerce").astype("float64")
+    # A finite close only: ±inf and NaN are not usable prices.
+    usable = dates.notna() & np.isfinite(closes)
     return bool(usable.any())
 
 

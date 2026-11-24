@@ -279,3 +279,124 @@ def test_g7_historical_request_uses_todays_cache_past_ttl(env, monkeypatch):
     # as_of before today: the same-day file is fresh regardless of TTL.
     out = ohlcv.load_ohlcv("AAPL", "2026-07-17")
     assert out["Close"].iloc[-1] == 101.0
+
+
+# --------------------------------------------------------------------------- #
+# Defect 2 — non-finite (±inf) closing prices are not usable market data
+# --------------------------------------------------------------------------- #
+
+def _inf_frame(closes):
+    """A dated frame (Date as a column) with the given Close values."""
+    n = len(closes)
+    dates = pd.to_datetime(["2026-07-16", "2026-07-17", "2026-07-18"])[:n]
+    return pd.DataFrame(
+        {
+            "Date": dates,
+            "Open": [100.0 + i for i in range(n)],
+            "High": [110.0 + i for i in range(n)],
+            "Low": [90.0 + i for i in range(n)],
+            "Close": list(closes),
+            "Volume": [1000 * (i + 1) for i in range(n)],
+        }
+    )
+
+
+@pytest.fixture
+def stats(monkeypatch):
+    """Reset the process-local cache stats before/after and expose the object."""
+    from tradingagents.dataflows.vendors.yahoo import cache
+
+    cache.STATS.reset()
+    yield cache.STATS
+    cache.STATS.reset()
+
+
+@pytest.mark.unit
+def test_inf_only_fresh_csv_is_refetched_not_served(env, monkeypatch, stats):
+    """A fresh CSV whose closes are only ±inf has no usable bar: it is a miss and
+    is refetched, and the caller never receives an infinite close."""
+    cache_dir, cache_file = env
+    _inf_frame([float("inf"), float("-inf")]).to_csv(cache_file, index=False)
+    _age_seconds(cache_file, 0)  # fresh today
+    before = stats.snapshot()
+    provider = _use(monkeypatch, Provider([_valid().set_index("Date")]))
+
+    out = ohlcv.load_ohlcv("AAPL", "2026-07-17")
+
+    after = stats.snapshot()
+    assert provider.calls == 1
+    assert after["load_attempts"] - before["load_attempts"] == 1
+    assert after["disk_hits"] - before["disk_hits"] == 0
+    assert out["Close"].tolist() == [100.0, 101.0]
+    assert not any(pd.isna(x) or abs(x) == float("inf") for x in out["Close"])
+    # Disk replaced with the finite replacement.
+    assert pd.read_csv(cache_file)["Close"].tolist() == [100.0, 101.0]
+
+
+@pytest.mark.unit
+def test_inf_only_download_is_rejected_no_data(env, monkeypatch, stats):
+    """A download whose closes are all ±inf is rejected: NoMarketDataError, no
+    file written, and no infinite close reaches the caller."""
+    cache_dir, cache_file = env
+    before = stats.snapshot()
+    provider = _use(monkeypatch, Provider([_inf_frame([float("inf"), float("-inf")]).set_index("Date")]))
+
+    with pytest.raises(NoMarketDataError, match="usable price rows"):
+        ohlcv.load_ohlcv("AAPL", "2026-07-17")
+
+    after = stats.snapshot()
+    assert provider.calls == 1
+    assert after["load_attempts"] - before["load_attempts"] == 1
+    assert after["load_failures"] - before["load_failures"] == 1
+    assert not cache_file.exists()  # nothing written for an unusable download
+
+
+@pytest.mark.unit
+def test_inf_only_refresh_preserves_valid_csv_bytewise(env, monkeypatch, stats):
+    """A current-day refresh that returns only non-finite closes must not
+    overwrite an existing valid CSV: it stays byte-for-byte intact."""
+    cache_dir, cache_file = env
+    _valid().to_csv(cache_file, index=False)
+    _age_seconds(cache_file, FRESH)  # current-day request refetches (TTL expired)
+    before_bytes = cache_file.read_bytes()
+    before = stats.snapshot()
+    provider = _use(monkeypatch, Provider([_inf_frame([float("inf")]).set_index("Date")]))
+
+    with pytest.raises(NoMarketDataError, match="usable price rows"):
+        ohlcv.load_ohlcv("AAPL", "2026-07-18")
+
+    after = stats.snapshot()
+    assert provider.calls == 1
+    assert after["load_attempts"] - before["load_attempts"] == 1
+    assert after["load_failures"] - before["load_failures"] == 1
+    assert cache_file.read_bytes() == before_bytes  # preserved byte-for-byte
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fill_gaps", [True, False])
+def test_mixed_inf_closes_kept_finite_dropped_inf(env, monkeypatch, stats, fill_gaps):
+    """With a mix of finite and infinite closes, finite-close rows are retained,
+    rows with ±inf closes are dropped as missing closes, and no infinite close
+    reaches the caller — in both fill_gaps modes."""
+    cache_dir, cache_file = env
+    _inf_frame([100.0, float("inf")]).to_csv(cache_file, index=False)
+    _age_seconds(cache_file, 0)  # fresh today
+    before = stats.snapshot()
+
+    def _must_not_download(*a, **k):
+        raise AssertionError("mixed finite/inf cache has a usable row; no refetch")
+
+    monkeypatch.setattr(ohlcv.yf, "Ticker",
+                        lambda s: type("P", (), {"history": _must_not_download})())
+
+    out = ohlcv.load_ohlcv("AAPL", "2026-07-17", fill_gaps=fill_gaps)
+
+    after = stats.snapshot()
+    # Served from disk (a usable finite row exists): no load.
+    assert after["disk_hits"] - before["disk_hits"] == 1
+    assert after["load_attempts"] - before["load_attempts"] == 0
+    # The finite row is retained; the ±inf row is dropped as a missing close.
+    assert 100.0 in out["Close"].tolist()
+    assert all(abs(x) != float("inf") for x in out["Close"])  # no infinite close
+    # The inf date never appears with an infinite price.
+    assert not (out["Close"].abs() == float("inf")).any()

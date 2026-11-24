@@ -562,3 +562,99 @@ def test_c9_timed_out_follower_keeps_flight_and_later_caller_joins_it(monkeypatc
     assert late_result["frame"]["Close"].iloc[0] == 105.0
     assert inflight.inflight_keys() == ()
     assert inflight.waiter_count(key) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Regression: concurrent reads of the same EXPIRED range entry must not raise
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.unit
+def test_c10_concurrent_reads_of_expired_entry_share_one_reload(fixed_clock, monkeypatch):
+    """Two concurrent public queries against the same expired entry both succeed
+    and share a single provider reload.
+
+    Before the ``_RangeCache`` lock, both callers fetched the entry, saw it
+    expired, and each ran ``del self._entries[key]`` — the second ``del`` raised
+    KeyError. Here the leader's reload is blocked in the provider while the
+    second caller joins the in-flight load; the pre-flight ``get`` on the expired
+    entry is exercised by both callers before either reloads.
+    """
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    fresh = _frame([("2026-01-02", 205.0), ("2026-01-05", 206.0)])
+    from tradingagents.dataflows.vendors.yahoo import cache
+
+    # Seed an EXPIRED entry for the exact key the public call computes.
+    market._range_cache.store(key, _frame([("2026-01-02", 111.0)]),
+                              fixed_clock["t"] - market._range_cache.ttl - 10)
+    before = cache.STATS.snapshot()
+
+    entered, release = threading.Event(), threading.Event()
+    ticker = BlockingTicker(fresh, entered=entered, release=release)
+    monkeypatch.setattr(market.yf, "Ticker", lambda symbol: ticker)
+
+    def call():
+        return market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+
+    results, errors = [None, None], [None, None]
+
+    def wrap(i):
+        try:
+            results[i] = call()
+        except BaseException as exc:  # noqa: BLE001
+            errors[i] = exc
+
+    t1 = threading.Thread(target=wrap, args=(0,))
+    t2 = threading.Thread(target=wrap, args=(1,))
+    t1.start()
+    assert entered.wait(JOIN_TIMEOUT), "leader never entered provider"
+    t2.start()
+    # The second caller joins the shared reload while the first is still blocked.
+    assert _wait_until(lambda: market._range_inflight.waiter_count(key) == 1, _deadline())
+    release.set()
+    t1.join(JOIN_TIMEOUT)
+    t2.join(JOIN_TIMEOUT)
+
+    # No KeyError (or any error) from either caller; both finished; both got the
+    # fresh reload value and an identical result.
+    assert errors == [None, None]
+    assert not t1.is_alive() and not t2.is_alive()
+    assert results[0] == results[1]
+    # Both callers see the fresh reload (closes 205/206), never the stale 111.
+    assert "2026-01-02,100.00,110.00,90.00,205.00" in results[0]
+    assert "2026-01-02,100.00,110.00,90.00,111.00" not in results[0]
+    assert ticker.calls == 1  # exactly one provider reload
+    # Exactly one cache load attempt for the two callers (the second coalesced).
+    after = cache.STATS.snapshot()
+    assert after["load_attempts"] - before["load_attempts"] == 1
+
+
+@pytest.mark.unit
+def test_c11_range_cache_lock_serialises_expired_delete(fixed_clock):
+    """Direct cache-layer check: many threads reading the same expired entry all
+    return ``None`` (a miss) without raising, whether or not they overlap.
+
+    This does not put a barrier inside ``_is_fresh`` (the fix holds the lock
+    there); it just hammers the same expired key from many threads and requires
+    no exception and a consistent miss, which the unlocked old code violated by
+    deleting the entry twice.
+    """
+    key = ("AAPL", "2026-01-02", "2026-01-07")
+    market._range_cache.store(key, _frame([("2026-01-02", 1.0)]),
+                              fixed_clock["t"] - market._range_cache.ttl - 10)
+    errors = []
+    misses = []
+
+    def reader():
+        try:
+            misses.append(market._range_cache.get(key, fixed_clock["t"]))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=reader) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(JOIN_TIMEOUT)
+
+    assert errors == []
+    assert all(m is None for m in misses)

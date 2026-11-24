@@ -58,6 +58,11 @@ class _RangeCache:
         self.ttl = ttl
         # key -> (stored_at, frame); OrderedDict preserves access order for LRU.
         self._entries: OrderedDict[tuple, tuple[float, pd.DataFrame]] = OrderedDict()
+        # Guard every entry mutation/clone: concurrent callers can read the same
+        # expired entry and both try to ``del`` it, which raised KeyError without
+        # this lock. The lock covers only the dict operations, never a provider
+        # load, so it does not serialise the downloads themselves.
+        self._lock = threading.Lock()
 
     def _is_fresh(self, stored_at: float, now: float) -> bool:
         return (now - stored_at) <= self.ttl
@@ -68,29 +73,34 @@ class _RangeCache:
         A missing, evicted, or expired entry is a miss (and an expired one is
         dropped). A hit renews the entry's recency for LRU eviction.
         """
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        stored_at, frame = entry
-        if not self._is_fresh(stored_at, now):
-            del self._entries[key]
-            return None
-        self._entries.move_to_end(key)
-        return frame.copy()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            stored_at, frame = entry
+            if not self._is_fresh(stored_at, now):
+                # Drop under the lock so a concurrent reader cannot del it again.
+                del self._entries[key]
+                return None
+            self._entries.move_to_end(key)
+            return frame.copy()
 
     def store(self, key: tuple, frame: pd.DataFrame, now: float) -> None:
         """Store a copy of ``frame`` for ``key``, evicting the LRU entry if full."""
-        self._entries[key] = (now, frame.copy())
-        self._entries.move_to_end(key)
-        while len(self._entries) > self.capacity:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[key] = (now, frame.copy())
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.capacity:
+                self._entries.popitem(last=False)
 
     def clear(self) -> None:
         """Drop every entry (used on a process-local reset)."""
-        self._entries.clear()
+        with self._lock:
+            self._entries.clear()
 
     def __len__(self) -> int:
-        return len(self._entries)
+        with self._lock:
+            return len(self._entries)
 
 
 _STAT_FIELDS = (
