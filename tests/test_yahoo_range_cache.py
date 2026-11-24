@@ -790,16 +790,18 @@ def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
     monkeypatch.setattr(market._range_cache, "get", controlled_get)
     monkeypatch.setattr(market.yf, "Ticker", Prov)
 
-    # Hold forced A at follow-up selection until C's provider call is active.
-    real_join = market._range_inflight._join_follow_up
+    # Hold forced A at follow-up selection (start of _follow_until_fresh, before
+    # it picks a flight) until C's provider call is active. This proves the
+    # occupied-key reuse path: A resumes while C's provider load is in progress.
+    real_follow = market._range_inflight._follow_until_fresh
     c_active = threading.Event()
 
-    def gated_join(k, original, loader, postprocess, timeout):
+    def gated_follow(k, joined, loader, postprocess, timeout):
         if threading.current_thread().name == "forcedA":
             assert c_active.wait(5), "new forced request never reached the provider"
-        return real_join(k, original, loader, postprocess, timeout)
+        return real_follow(k, joined, loader, postprocess, timeout)
 
-    monkeypatch.setattr(market._range_inflight, "_join_follow_up", gated_join)
+    monkeypatch.setattr(market._range_inflight, "_follow_until_fresh", gated_follow)
 
     res, err = {}, {}
 
@@ -836,14 +838,16 @@ def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
     t_c.start()
     assert provider_entered.wait(5), "new forced request never entered provider"
     c_active.set()  # let A resume at follow-up selection, provider still active
-
+    # A must have joined C's active flight before we release the provider, else A
+    # could arrive after C pops the key and start a second load (test race).
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) >= 1), "A never joined C"
     provider_release.set()
     t_ord.join(6)
     t_a.join(6)
     t_c.join(6)
 
     monkeypatch.setattr(market._range_cache, "get", real_get)
-    monkeypatch.setattr(market._range_inflight, "_join_follow_up", real_join)
+    monkeypatch.setattr(market._range_inflight, "_follow_until_fresh", real_follow)
 
     assert err == {}
     assert not (t_ord.is_alive() or t_a.is_alive() or t_c.is_alive())
@@ -858,3 +862,165 @@ def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
     out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
     assert len(calls) == before + 1
     assert "999.00" in out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("provider_outcome", ["fresh", "error"])
+def test_r12_forced_follower_over_ordinary_recheck_gets_provider_result(clock, monkeypatch, provider_outcome):
+    """A forced caller that first joins a completed cache-only flight O1, and then
+    finds ANOTHER ordinary cache-recheck flight O2 owning the key, must continue
+    past O2 to provider data (or the shared provider error) -- never return O2's
+    cached frame.
+
+    Deterministic ordering, all bounded events:
+      1. O1 (ordinary) runs and resolves from a cache recheck (loaded=False).
+      2. Forced A joins O1.
+      3. Before A traverses, O2 (another ordinary) owns the key (in-flight leader)
+         and A is confirmed joined to the key's flight before O2 is released.
+      4. O2 is released to return loaded=False (cached 100) while A traverses.
+
+    Pre-fix: A reuses O2 and returns cached 100 with 0 provider calls.
+    Fixed:   A continues to a real provider load -> provider_outcome.
+    """
+    from tradingagents.dataflows.errors import VendorUnavailableError
+
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    old = _frame([("2026-01-02", 100.0), ("2026-01-05", 101.0), ("2026-01-06", 102.0)])
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    calls = []
+
+    class Prov:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, **kw):
+            calls.append(1)
+            if provider_outcome == "error":
+                raise VendorUnavailableError("boom")
+            return fresh.copy()
+
+    # O1's ordinary get: pre-flight miss, then gated recheck hit (cached 100).
+    real_get = market._range_cache.get
+    tls = threading.local()
+    o1_gate = threading.Event()
+    o1_at_recheck = threading.Event()
+
+    def controlled_get(k, now):
+        if k != key or threading.current_thread().name != "ord1":
+            return real_get(k, now)
+        phase = getattr(tls, "phase", 0)
+        tls.phase = phase + 1
+        if phase == 0:
+            return None
+        if phase == 1:
+            o1_at_recheck.set()
+            assert o1_gate.wait(5)
+            return old.copy()  # recorded (never stored) cache-recheck frame (loaded=False)
+        return real_get(k, now)
+
+    monkeypatch.setattr(market._range_cache, "get", controlled_get)
+    monkeypatch.setattr(market.yf, "Ticker", Prov)
+
+    # Gate forced A at the start of its follow traversal until O2 owns the key, so
+    # A cannot lead an early load before O2 becomes the key owner. After the gate
+    # opens, A proceeds to join O2; we confirm that before releasing O2.
+    a_go = threading.Event()
+    orig_seam = {}
+    for attr in ("_follow_until_fresh", "_join_follow_up"):
+        if hasattr(market._range_inflight, attr):
+            orig_seam[attr] = getattr(market._range_inflight, attr)
+
+    def make_gate(real):
+        def gated(*a, **k):
+            if threading.current_thread().name == "forcedA":
+                assert a_go.wait(5), "forced A gate never opened"
+            return real(*a, **k)
+        return gated
+
+    for attr, real in orig_seam.items():
+        monkeypatch.setattr(market._range_inflight, attr, make_gate(real))
+
+    res, err = {}, {}
+
+    def ordinary_o1():
+        tls.phase = 0
+        try:
+            res["o1"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+        except BaseException as exc:  # noqa: BLE001
+            err["o1"] = exc
+
+    def forced_a():
+        try:
+            res["A"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err["A"] = exc
+
+    # 1-2: start O1, then A joins O1's (recheck-only) flight while O1 is gated.
+    t1 = threading.Thread(target=ordinary_o1, name="ord1")
+    t1.start()
+    assert o1_at_recheck.wait(5), "O1 never reached its recheck"
+    t_a = threading.Thread(target=forced_a, name="forcedA")
+    t_a.start()
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) >= 1), "A never joined O1"
+    o1_gate.set()  # O1 resolves from the cache recheck (loaded=False); A abandons to traverse
+    t1.join(5)
+
+    # 3: O2 (another ordinary) starts and owns the key; A traverses and joins O2
+    # as a waiter. O2 is held at its recheck so we can confirm A joined it BEFORE
+    # O2 returns loaded=False.
+    o2_gate = threading.Event()
+    o2_phase = threading.local()
+
+    def controlled_get_o2(k, now):
+        if k != key or threading.current_thread().name != "ord2":
+            return real_get(k, now)
+        phase = getattr(o2_phase, "n", 0)
+        o2_phase.n = phase + 1
+        if phase == 0:
+            return None
+        if phase == 1:
+            assert o2_gate.wait(5)
+            return old.copy()
+        return real_get(k, now)
+
+    monkeypatch.setattr(market._range_cache, "get", controlled_get_o2)
+
+    def ordinary_o2():
+        try:
+            res["o2"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+        except BaseException as exc:  # noqa: BLE001
+            err["o2"] = exc
+
+    t2 = threading.Thread(target=ordinary_o2, name="ord2")
+    t2.start()
+    # O2 owns the key (it is the in-flight leader). Open A's gate so it proceeds
+    # to join O2, then confirm A has joined before releasing O2 to loaded=False.
+    assert _wait_until_lambda(lambda: key in market._range_inflight.inflight_keys())
+    a_go.set()
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) >= 1), "A never joined O2"
+    o2_gate.set()  # now release O2 to return loaded=False (cached 100) while A follows
+
+    t_a.join(6)
+    t2.join(6)
+
+    for attr, real in orig_seam.items():
+        monkeypatch.setattr(market._range_inflight, attr, real)
+    monkeypatch.setattr(market._range_cache, "get", real_get)
+
+    assert not (t_a.is_alive() or t2.is_alive())
+    if provider_outcome == "fresh":
+        assert err == {}
+        # The forced caller gets provider data (999), never cached 100.
+        assert "999.00" in res["A"]
+        assert "2026-01-02,100.00,110.00,90.00,100.00" not in res["A"]
+        assert len(calls) == 1  # exactly one provider load for A's traversal
+        # A separate later refresh starts a new load.
+        before = len(calls)
+        out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        assert len(calls) == before + 1
+        assert "999.00" in out
+    else:
+        # Provider-error variant: the forced caller receives that error, not cached.
+        assert isinstance(err.get("A"), VendorUnavailableError)
+        assert "A" not in res
+        assert len(calls) == 1
