@@ -99,12 +99,19 @@ class GraphSetup:
         deep_thinking_llm: Any,
         conditional_logic: ConditionalLogic,
         max_tool_rounds: int,
+        memory_reader=None,
     ):
-        """Initialize with required components."""
+        """Initialize with required components.
+
+        ``memory_reader``, when given, is called by the Portfolio Manager just
+        before it assembles its prompt; it returns ``(past_context, note)``.
+        Without one, the Portfolio Manager reads ``past_context`` from state.
+        """
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.conditional_logic = conditional_logic
         self.max_tool_rounds = max_tool_rounds
+        self.memory_reader = memory_reader
 
     def setup_graph(
         self, selected_analysts=("market", "social", "news", "fundamentals"), memory_node=None
@@ -137,7 +144,9 @@ class GraphSetup:
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        portfolio_manager_node = create_portfolio_manager(
+            self.deep_thinking_llm, memory_reader=self.memory_reader
+        )
 
         workflow = StateGraph(AgentState)
 

@@ -20,7 +20,14 @@ from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.structured import NO_EXTERNAL_TOOLS, bind_structured, invoke_structured
 
 
-def create_portfolio_manager(llm):
+def create_portfolio_manager(llm, memory_reader=None):
+    """Build the Portfolio Manager node.
+
+    ``memory_reader(ticker, trade_date)`` returns ``(past_context, note)`` and
+    is called once, before the prompt is assembled, when review is enabled. It
+    lets a resumed run read a revocation saved after the checkpoint. Without a
+    reader, the node uses the ``past_context`` the Memory Log step put in state.
+    """
     structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
 
     def portfolio_manager_node(state) -> dict:
@@ -32,7 +39,16 @@ def create_portfolio_manager(llm):
         research_plan = state["investment_plan"]
         trader_plan = state["trader_investment_plan"]
 
-        past_context = state.get("past_context", "")
+        read_note = ""
+        if memory_reader is not None:
+            past_context, read_note = memory_reader(
+                state["company_of_interest"], state["trade_date"]
+            )
+        else:
+            past_context = state.get("past_context", "")
+        memory_note = " ".join(
+            part for part in (state.get("memory_note", ""), read_note) if part
+        )
         lessons_line = (
             f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
             if past_context
@@ -101,6 +117,8 @@ Write these sections, in this order, starting with the rating on its own line:
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
             "final_rating": final_rating,
+            "past_context": past_context,
+            "memory_note": memory_note,
         }
 
     return portfolio_manager_node

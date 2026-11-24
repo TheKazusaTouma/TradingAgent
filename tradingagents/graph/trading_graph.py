@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,13 @@ from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_tier_client, tier_provider
-from tradingagents.memory import TradingMemoryLog, settlement
+from tradingagents.memory import (
+    ReviewLedger,
+    ReviewLedgerError,
+    TradingMemoryLog,
+    review_cutoff,
+    settlement,
+)
 from tradingagents.memory.reflection import Reflector
 from tradingagents.observability import TraceSession
 from tradingagents.reporting import write_report_tree
@@ -26,6 +32,11 @@ from .propagation import Propagator
 from .setup import GraphSetup
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> datetime:
+    """The run's clock, in one place so a run mode and its cutoff agree."""
+    return datetime.now(UTC)
 
 
 def _validate_trade_date(trade_date) -> str:
@@ -46,6 +57,10 @@ def _validate_trade_date(trade_date) -> str:
 # whether it checkpoints, and how often it retries a provider.
 _NOT_IN_SIGNATURE = frozenset({
     "results_dir", "data_cache_dir", "memory_log_path", "checkpoint_enabled", "llm_max_retries",
+    # A False/absent flag must reproduce the pre-review signature, so a checkpoint
+    # written before review existed still resumes. Only the enabled case is added
+    # to the signature below.
+    "memory_review_enabled",
 })
 
 
@@ -81,6 +96,7 @@ class TradingAgentsGraph:
         self.quick_thinking_llm = create_tier_client(self.config, "quick", **extra).get_llm()
 
         self.memory_log = TradingMemoryLog(self.config)
+        self.review_ledger = ReviewLedger(self.config.get("memory_log_path"))
 
         self.conditional_logic = ConditionalLogic(
             max_debate_rounds=self.config["max_debate_rounds"],
@@ -99,6 +115,11 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.conditional_logic,
             max_tool_rounds,
+            memory_reader=(
+                self._read_memory_for_pm
+                if self.config.get("memory_review_enabled")
+                else None
+            ),
         )
 
         self.propagator = Propagator(
@@ -153,7 +174,7 @@ class TradingAgentsGraph:
         """
         settings = {k: v for k, v in self.config.items() if k not in _NOT_IN_SIGNATURE}
         digest = hashlib.sha256(json.dumps(settings, sort_keys=True, default=str).encode()).hexdigest()[:12]
-        return "|".join([
+        parts = [
             "analysts=" + ",".join(self.selected_analysts),
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
@@ -165,8 +186,13 @@ class TradingAgentsGraph:
             # before the Memory Log step would resume without the lessons.
             "analysts=parallel",
             "memory=parallel",
-            f"settings={digest}",
-        ])
+        ]
+        # Review changes which memory reaches the PM, so it gets its own signature.
+        # Left out when off: the old signature must still resume an old checkpoint.
+        if self.config.get("memory_review_enabled"):
+            parts.append("memory=review")
+        parts.append(f"settings={digest}")
+        return "|".join(parts)
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock", portfolio=None):
         """Run the trading agents graph for a company on a specific date.
@@ -326,6 +352,10 @@ class TradingAgentsGraph:
         so it runs beside the analysts instead of before them. A failure here
         does not end the run: the analysts' work is kept, the lessons already in
         the log are used, and the report says what could not be settled.
+
+        With review enabled, this step only settles. The Portfolio Manager reads
+        the approved lessons itself, so a revocation saved before a resumed run
+        reaches it.
         """
         note = ""
         try:
@@ -337,6 +367,8 @@ class TradingAgentsGraph:
         except Exception as exc:
             logger.warning("Settling past decisions failed: %s", exc)
             note = f"Past decisions could not be settled this run ({type(exc).__name__}); they stay pending."
+        if self.config.get("memory_review_enabled"):
+            return {"past_context": "", "memory_note": note}
         try:
             past_context = self.memory_log.get_past_context(
                 state["company_of_interest"], as_of=self._memory_as_of(state["trade_date"]))
@@ -345,6 +377,34 @@ class TradingAgentsGraph:
             past_context = ""
             note = note or f"The memory log could not be read this run ({type(exc).__name__})."
         return {"past_context": past_context, "memory_note": note}
+
+    def _read_memory_for_pm(self, ticker: str, trade_date: str) -> tuple[str, str]:
+        """Read the approved lessons once, for the Portfolio Manager's input.
+
+        The review ledger's cutoff is the run's own point in time, so a resumed
+        historical run sees the approvals that existed then. A ledger that
+        cannot be read fails closed: no lesson is injected and the reason goes
+        to the report.
+        """
+        # Decide the run mode once: settlement filtering and the review cutoff
+        # must agree on the same answer.
+        historical = is_historical(trade_date)
+        as_of = str(trade_date) if historical else None
+        cutoff = review_cutoff(trade_date, _utc_now(), historical=historical)
+        try:
+            return self.memory_log.get_past_context(
+                ticker,
+                as_of=as_of,
+                review_ledger=self.review_ledger,
+                cutoff=cutoff,
+            ), ""
+        except ReviewLedgerError as exc:
+            logger.warning("Reading the review ledger failed: %s", exc)
+            return "", ("The review ledger could not be read this run "
+                        f"({exc}); no reviewed memory was used.")
+        except Exception as exc:
+            logger.warning("Reading the memory log failed: %s", exc)
+            return "", f"The memory log could not be read this run ({type(exc).__name__})."
 
     def settle_pending(self, company_name) -> settlement.Settlement:
         """Settle this ticker's decisions whose holding window has now traded.
