@@ -13,4 +13,5 @@ ta = TradingAgentsGraph(debug=True, config=config)
 
 # forward propagate
 _, decision = ta.propagate("NVDA", "2026-09-01")
+print(f"Trace ID: {ta.last_trace_id}")
 print(decision)

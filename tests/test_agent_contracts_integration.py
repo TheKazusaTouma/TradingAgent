@@ -1315,3 +1315,51 @@ def test_h_off_mode_trader_reads_are_unchanged_for_a_valid_fixture(variant):
     llm.with_structured_output.assert_called_once()
     assert update["trader_investment_plan"]
     assert "contract_records" not in update
+
+
+def test_review_memory_contract_and_trace_work_together(tmp_path, monkeypatch, offline):
+    """The reviewed memory reaches the strict PM and the same run is traced."""
+    import json
+
+    seen = []
+    def read_reviewed(_self, ticker, date):
+        seen.append((ticker, date))
+        return "reviewed lesson marker", ""
+
+    monkeypatch.setattr(trading_graph.TradingAgentsGraph, "_read_memory_for_pm", read_reviewed)
+    model = AgentModel(structured=True)
+    graph = _graph(tmp_path, monkeypatch, model, agent_contract_mode="validate",
+                   memory_review_enabled=True, checkpoint_enabled=True)
+    state, signal = graph.propagate("NVDA", TRADE_DATE)
+
+    assert seen == [("NVDA", TRADE_DATE)]
+    assert state["past_context"] == "reviewed lesson marker"
+    assert signal == "Overweight"
+    assert graph.contract_records()["Portfolio Manager"].ok
+    assert "memory=review" in graph._run_signature("stock")
+    assert "contract=validate@" in graph._run_signature("stock")
+    trace = tmp_path / "results" / "NVDA" / TRADE_DATE / "trace" / f"{graph.last_trace_id}.jsonl"
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert events and events[0]["event"] == "run_start"
+    assert events[-1]["event"] == "run_end"
+    assert all(event["trace_id"] == graph.last_trace_id for event in events)
+
+
+def test_cli_contract_failure_is_also_a_failed_trace(tmp_path, monkeypatch, offline):
+    """A rejected decision produces an audit and a failed trace, never a success."""
+    import json
+
+    model = AgentModel(structured=True, answers=ScriptedAnswers(StrictPortfolioDecision=[PM_BAD]))
+    graph, recorded, cleared = _cli_run(tmp_path, monkeypatch, model, mode="validate")
+    with pytest.raises(AgentContractError):
+        cli_run_run_analysis()
+
+    assert not recorded and not cleared
+    assert list((tmp_path / "results" / "failed_runs").glob("NVDA*.md"))
+    traces = list((tmp_path / "results" / "NVDA" / TRADE_DATE / "trace").glob("*.jsonl"))
+    assert len(traces) == 1
+    events = [json.loads(line) for line in traces[0].read_text(encoding="utf-8").splitlines()]
+    assert events and events[0]["event"] == "run_start"
+    assert events[-1]["event"] == "run_fail"
+    assert not any(event["event"] == "run_end" for event in events)
+    assert graph.memory_log.load_entries() == []
