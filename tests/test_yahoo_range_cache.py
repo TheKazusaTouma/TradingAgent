@@ -796,10 +796,10 @@ def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
     real_follow = market._range_inflight._follow_until_fresh
     c_active = threading.Event()
 
-    def gated_follow(k, joined, loader, postprocess, timeout):
+    def gated_follow(k, joined, loader, postprocess, timeout, **kwargs):
         if threading.current_thread().name == "forcedA":
             assert c_active.wait(5), "new forced request never reached the provider"
-        return real_follow(k, joined, loader, postprocess, timeout)
+        return real_follow(k, joined, loader, postprocess, timeout, **kwargs)
 
     monkeypatch.setattr(market._range_inflight, "_follow_until_fresh", gated_follow)
 
@@ -832,6 +832,10 @@ def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
     t_a.start()
     assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) == 1)
     recheck_gate.set()  # ordinary resolves from the cache recheck
+    # Let O1 fully complete (and pop the key) before C starts, so C leads a fresh
+    # provider load rather than joining O1's already-resolving flight.
+    t_ord.join(5)
+    assert not t_ord.is_alive(), "ordinary request did not finish"
 
     # C: a separate same-key forced request starts and blocks in the provider.
     t_c = threading.Thread(target=forced_c, name="forcedC")
@@ -1024,3 +1028,92 @@ def test_r12_forced_follower_over_ordinary_recheck_gets_provider_result(clock, m
         assert isinstance(err.get("A"), VendorUnavailableError)
         assert "A" not in res
         assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Regression: _Inflight coalesced_waits accounting (paired wait per join)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.unit
+def test_w1_forced_join_active_load_counts_one_wait():
+    """A forced follower joining an ACTIVE provider load increments coalesced_waits
+    exactly once, and the joined flight's waiter count returns to zero."""
+    import threading as _t
+
+    from tradingagents.dataflows.vendors.yahoo.cache import CacheStats, _Flight, _Inflight
+
+    def frame(c):
+        return pd.DataFrame({"Close": [c]}, index=pd.DatetimeIndex(["2026-01-02"], name="Date"))
+
+    stats = CacheStats()
+    inflight = _Inflight(stats=stats)
+    key = ("K",)
+    active = _Flight()
+    inflight._flights[key] = active
+    release = _t.Event()
+
+    def leader():
+        assert release.wait(5)
+        with inflight._lock:
+            active.result = frame(999.0)
+            active.loaded = True
+            inflight._flights.pop(key, None)
+            active.done.set()
+
+    t_leader = _t.Thread(target=leader)
+    t_leader.start()
+    out = {}
+
+    def forced():
+        out["v"] = inflight.run(key, lambda: (frame(999.0), True),
+                                require_fresh=True, timeout=5)
+
+    t_forced = _t.Thread(target=forced)
+    t_forced.start()
+    # The forced caller has joined the active flight (one waiter) before release.
+    assert _wait_until_lambda(lambda: inflight.waiter_count(key) == 1)
+    release.set()
+    t_leader.join(6)
+    t_forced.join(6)
+
+    assert not t_forced.is_alive()
+    assert float(out["v"]["Close"].iloc[0]) == 999.0
+    assert stats.snapshot()["coalesced_waits"] == 1  # exactly one wait for one join
+    assert active.waiters == 0                        # paired: decremented back to 0
+
+
+@pytest.mark.unit
+def test_w2_late_caller_reusing_completed_follow_up_adds_no_wait():
+    """A late caller reusing an already-completed follow-up receives its result with
+    no new coalesced wait counted, and the completed flight's waiter count stays 0."""
+    from tradingagents.dataflows.vendors.yahoo.cache import CacheStats, _Flight, _Inflight
+
+    def frame(c):
+        return pd.DataFrame({"Close": [c]}, index=pd.DatetimeIndex(["2026-01-02"], name="Date"))
+
+    stats = CacheStats()
+    inflight = _Inflight(stats=stats)
+    key = ("K",)
+    # The flight the caller first joins: a completed cache-only flight.
+    original = _Flight()
+    original.result = frame(100.0)
+    original.loaded = False
+    original.done.set()
+    inflight._flights[key] = original
+    # Its follow-up already completed with provider data.
+    follow = _Flight()
+    follow.result = frame(999.0)
+    follow.loaded = True
+    follow.done.set()
+    original.follow_up = follow
+
+    out = {}
+    t = threading.Thread(target=lambda: out.__setitem__(
+        "v", inflight.run(key, lambda: (frame(999.0), True), require_fresh=True, timeout=5)))
+    t.start()
+    t.join(6)
+
+    assert not t.is_alive()
+    assert float(out["v"]["Close"].iloc[0]) == 999.0      # reused follow-up result
+    assert stats.snapshot()["coalesced_waits"] == 1        # only the initial join
+    assert follow.waiters == 0                             # completed flight stays at 0

@@ -224,12 +224,15 @@ class _Inflight:
                 flight.waiters += 1
 
         if not leader:
-            self._stats.incr("coalesced_waits")
             if require_fresh:
                 # A forced caller must never accept a result a leader served from
                 # a cache recheck (loaded=False). Traverse onward from that flight
-                # until provider data or a shared error is reached.
-                return self._follow_until_fresh(key, flight, loader, postprocess, timeout)
+                # until provider data or a shared error is reached. ``flight`` is
+                # already registered (its waiter counted in ``run``) and is not
+                # yet counted as a coalesced wait here.
+                return self._follow_until_fresh(key, flight, loader, postprocess, timeout,
+                                                first_joined=True)
+            self._stats.incr("coalesced_waits")
             try:
                 finished = flight.done.wait(timeout)
             finally:
@@ -244,23 +247,22 @@ class _Inflight:
 
         return self._lead(key, flight, loader, postprocess)
 
-    def _follow_until_fresh(self, key, flight: _Flight, loader, postprocess, timeout):
+    def _follow_until_fresh(self, key, flight: _Flight, loader, postprocess, timeout, *,
+                            first_joined: bool):
         """Iteratively continue from completed cache-only flights until fresh data.
 
-        Called by ``require_fresh`` callers with a flight they have already joined
-        (its ``waiters`` counted). Each loop waits on the current flight; if it
-        resolves with provider data or an error, return/raise. If it resolved from
-        a cache recheck (loaded=False), continue from it: reuse the follow-up it
-        already links to, else the flight currently owning ``key``, else lead a
-        new follow-up registered under the key so same-key callers coalesce onto
-        it. ``visited`` stops us revisiting a completed flight (so we never wait
-        forever or start a parallel load). Follow-up links are kept for late
-        waiters; I/O and waits happen outside the lock.
+        Accounting invariant: at the top of the waiting loop the current
+        ``flight`` has our waiter registered and has NOT yet been counted. Each
+        iteration counts exactly one ``coalesced_waits`` and performs exactly one
+        waiter decrement -- so every registration is paired with one decrement and
+        one wait. An *already completed* flight is consumed without registering,
+        waiting, or counting (a late caller reusing a finished follow-up adds no
+        wait and leaves its waiter count at zero). A newly created flight is
+        *led* (a real provider load), never waited on by its creator.
         """
         visited: set[int] = set()
-        leader_of: _Flight | None = None
-        while leader_of is None:
-            # Wait on the current, already-joined flight (outside the lock).
+        while True:
+            # Phase 1: wait on the registered flight (counts one wait, one decrement).
             self._stats.incr("coalesced_waits")
             try:
                 finished = flight.done.wait(timeout)
@@ -276,34 +278,51 @@ class _Inflight:
                 return postprocess(result) if postprocess else result
             visited.add(id(flight))
 
-            # ``flight`` completed from a cache recheck: choose where to continue.
+            # Phase 2: continue past this completed cache-only flight. Under the
+            # lock, walk completed follow-ons without registering; then either lead
+            # a newly created flight (OUTSIDE the lock) or register on an
+            # in-progress one. I/O must never run while holding the lock.
+            lead_target = None
             with self._lock:
-                nxt = flight.follow_up
-                if nxt is None or id(nxt) in visited:
-                    existing = self._flights.get(key)
-                    if existing is not None and id(existing) not in visited:
-                        nxt = existing
-                    else:
-                        nxt = _Flight()
-                        self._flights[key] = nxt
-                        leader_of = nxt  # we created it: lead the provider load
-                    flight.follow_up = nxt  # preserve link for late waiters
-                if id(nxt) in visited:
-                    # Defensive: a fully explored chain; lead a fresh flight.
-                    nxt = _Flight()
-                    self._flights[key] = nxt
-                    leader_of = nxt
-                    flight.follow_up = nxt
-                if leader_of is None:
-                    if nxt.done.is_set():
-                        # ``nxt`` already completed (another cache recheck): loop
-                        # onto it without waiting (visited guards the re-visit).
-                        flight = nxt
-                        continue
-                    nxt.waiters += 1  # join the in-progress flight and wait
-                    flight = nxt
+                nxt, created = self._next_flight_locked(key, flight, visited)
+                while not created and nxt.done.is_set():
+                    if nxt.error is not None:
+                        raise nxt.error
+                    if nxt.loaded:
+                        result = nxt.result.copy()
+                        return postprocess(result) if postprocess else result
+                    visited.add(id(nxt))
+                    nxt, created = self._next_flight_locked(key, nxt, visited)
+                if created:
+                    lead_target = nxt
+                else:
+                    nxt.waiters += 1  # in-progress: join it; next loop waits (paired)
 
-        return self._lead(key, leader_of, loader, postprocess)
+            if lead_target is not None:
+                return self._lead(key, lead_target, loader, postprocess)
+            flight = nxt
+
+    def _next_flight_locked(self, key, flight: _Flight, visited: set):
+        """Under the lock, choose where to continue from a loaded=False ``flight``,
+        linking it as ``flight.follow_up`` for late waiters. Returns
+        ``(flight, created)`` where ``created`` is True when a brand-new flight was
+        made (the caller must lead it) and False when an existing one was reused."""
+        nxt = flight.follow_up
+        if nxt is not None and id(nxt) in visited:
+            nxt = None
+        if nxt is None:
+            existing = self._flights.get(key)
+            if existing is not None and id(existing) not in visited:
+                nxt = existing
+                created = False
+            else:
+                nxt = _Flight()
+                self._flights[key] = nxt
+                created = True
+        else:
+            created = False
+        flight.follow_up = nxt
+        return nxt, created
 
     def _lead(self, key: tuple, flight: _Flight, loader, postprocess):
         """Run ``loader`` as ``flight``'s leader (outside the lock)."""
