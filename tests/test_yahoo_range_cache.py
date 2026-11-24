@@ -8,6 +8,9 @@ and the small ``cache._RangeCache`` it uses.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pandas as pd
 import pytest
 
@@ -291,3 +294,567 @@ def test_t10_output_matches_baseline_cold_and_warm(clock, monkeypatch):
     assert cold == EXPECTED_CACHE_OFF
     assert warm == EXPECTED_CACHE_OFF
     assert provider.count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Regression: range downloads validated before storing / publishing
+# --------------------------------------------------------------------------- #
+
+def _stale_frame():
+    """A frame whose only usable row is far older than the requested window."""
+    idx = pd.DatetimeIndex(["2020-01-02"], name="Date")
+    return pd.DataFrame(
+        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [10.0], "Volume": [1]},
+        index=idx,
+    )
+
+
+@pytest.mark.unit
+def test_r1_stale_not_cached_then_identical_request_refetches(clock, monkeypatch):
+    """A stale first response raises and is NOT cached; an identical request within
+    the TTL calls the provider again and returns the fresh data (2 calls)."""
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    fresh = _frame([("2026-01-02", 205.0), ("2026-01-05", 206.0), ("2026-01-06", 207.0)])
+    provider = _use(monkeypatch, FakeProvider([_stale_frame(), fresh]))
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+
+    with pytest.raises(NoMarketDataError):
+        market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    # The stale frame must not have entered the success cache.
+    assert market._range_cache.get(key, clock["t"]) is None
+
+    out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    assert provider.count == 2  # refetched; not served from a cached stale entry
+    assert "205.00" in out
+
+
+@pytest.mark.unit
+def test_r2_recent_inf_tail_with_old_finite_row_is_rejected(clock, monkeypatch):
+    """A recent row with a ±inf close does not count as the latest quote: an older
+    finite row behind it is judged stale, so the response is rejected and a later
+    identical request refetches and recovers."""
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    # Old finite row (2020) + a recent row (2026-01-06) whose close is inf.
+    bad = pd.DataFrame(
+        {"Open": [1.0, 2.0], "High": [1.0, 2.0], "Low": [1.0, 2.0],
+         "Close": [100.0, float("inf")], "Volume": [1, 2]},
+        index=pd.DatetimeIndex(["2020-01-02", "2026-01-06"], name="Date"),
+    )
+    fresh = _frame([("2026-01-02", 205.0), ("2026-01-05", 206.0), ("2026-01-06", 207.0)])
+    provider = _use(monkeypatch, FakeProvider([bad, fresh]))
+
+    with pytest.raises(NoMarketDataError):
+        market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    assert provider.count == 2
+    assert "205.00" in out
+    assert "inf" not in out.lower()  # the recovered output carries no infinite close
+
+
+# --------------------------------------------------------------------------- #
+# Regression: refresh never accepts an ordinary request's cache-recheck result
+# --------------------------------------------------------------------------- #
+
+class BlockingProvider:
+    """history() blocks the first call until released; records that it entered."""
+
+    def __init__(self, frame):
+        self.frame = frame
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def history(self, **kwargs):
+        self.calls += 1
+        self.entered.set()
+        assert self.release.wait(5), "provider never released"
+        return self.frame.copy()
+
+
+@pytest.mark.unit
+def test_r3_refresh_bypasses_ordinary_recheck_hit(clock, monkeypatch):
+    """A forced caller that overlaps an ordinary request whose flight resolves
+    only from the cache recheck must still receive freshly fetched data.
+
+    Deterministic setup: the ordinary request's pre-flight get misses, then its
+    in-flight recheck returns a cached OLD frame (no provider call) while a
+    refresh=True caller overlaps. The refresh must not accept the cached result;
+    it goes through the same-key loading path and fetches (close 999).
+    """
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    old = _frame([("2026-01-02", 100.0), ("2026-01-05", 101.0), ("2026-01-06", 102.0)])
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    calls = []
+
+    class Prov:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, **kw):
+            calls.append(1)
+            return fresh.copy()
+
+    real_get = market._range_cache.get
+    tls = threading.local()
+    recheck_gate = threading.Event()
+
+    def controlled_get(k, now):
+        if k != key:
+            return real_get(k, now)
+        phase = getattr(tls, "phase", 0)
+        tls.phase = phase + 1
+        if phase == 0:
+            return None  # ordinary pre-flight miss
+        if phase == 1:
+            recheck_gate.wait(5)  # hold the ordinary in-flight recheck
+            return old.copy()     # recheck hit: cached OLD frame, no provider call
+        return real_get(k, now)
+
+    monkeypatch.setattr(market._range_cache, "get", controlled_get)
+    monkeypatch.setattr(market.yf, "Ticker", Prov)
+
+    res = {}
+
+    def ordinary():
+        tls.phase = 0
+        res["ord"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+
+    def forced():
+        res["for"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+
+    t1 = threading.Thread(target=ordinary)
+    t1.start()
+    time.sleep(0.1)  # let the ordinary request reach its recheck
+    t2 = threading.Thread(target=forced)
+    t2.start()
+    time.sleep(0.1)  # let the refresh overlap the ordinary flight
+    recheck_gate.set()
+    t1.join(5)
+    t2.join(5)
+    monkeypatch.setattr(market._range_cache, "get", real_get)
+
+    # The forced caller got freshly fetched data, never the cached 100.
+    assert "999.00" in res["for"]
+    assert "2026-01-02,100.00,110.00,90.00,100.00" not in res["for"]
+    assert len(calls) >= 1  # the refresh triggered a real provider load
+
+
+@pytest.mark.unit
+def test_r4_refresh_joins_active_ordinary_provider_load(clock, monkeypatch):
+    """A forced caller that joins an ordinary request's ACTIVE provider load shares
+    that one load (same-key coalescing preserved): exactly one provider call, both
+    get the fresh result."""
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    provider = BlockingProvider(fresh)
+    monkeypatch.setattr(market.yf, "Ticker", lambda s: provider)
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    res = {}
+
+    res_err = {}
+
+    def call(tag, refresh):
+        try:
+            res[tag] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=refresh)
+        except BaseException as exc:  # noqa: BLE001
+            res_err[tag] = exc
+
+    t_ord = threading.Thread(target=call, args=("ord", False))
+    t_ord.start()
+    assert provider.entered.wait(5)
+    t_for = threading.Thread(target=call, args=("for", True))
+    t_for.start()
+    # The forced caller joins the same in-flight load.
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) == 1)
+    provider.release.set()
+    t_ord.join(5)
+    t_for.join(5)
+
+    assert res_err == {}
+    assert provider.calls == 1  # one shared provider load
+    assert "999.00" in res["ord"] and "999.00" in res["for"]
+
+
+@pytest.mark.unit
+def test_r5_two_overlapping_refreshes_share_one_load(clock, monkeypatch):
+    """Two overlapping forced refreshes coalesce onto one provider load."""
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    provider = BlockingProvider(fresh)
+    monkeypatch.setattr(market.yf, "Ticker", lambda s: provider)
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    res, err = {}, {}
+
+    def call(tag):
+        try:
+            res[tag] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err[tag] = exc
+
+    t1 = threading.Thread(target=call, args=("a",))
+    t1.start()
+    assert provider.entered.wait(5)
+    t2 = threading.Thread(target=call, args=("b",))
+    t2.start()
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) == 1)
+    provider.release.set()
+    t1.join(5)
+    t2.join(5)
+
+    assert err == {}
+    assert provider.calls == 1  # one shared forced load
+    assert "999.00" in res["a"] and "999.00" in res["b"]
+
+
+def _wait_until_lambda(pred):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+# --------------------------------------------------------------------------- #
+# Regression: ±inf closing prices in the date-range path
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.unit
+def test_r6_inf_only_range_raises_and_retry_recovers(clock, monkeypatch):
+    """An inf-only (±inf) response raises NoMarketDataError (nothing cached); a
+    later identical request retries and returns fresh data."""
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    inf_frame = _frame([("2026-01-02", float("inf")), ("2026-01-05", float("-inf")),
+                        ("2026-01-06", float("inf"))])
+    fresh = _frame([("2026-01-02", 205.0), ("2026-01-05", 206.0), ("2026-01-06", 207.0)])
+    provider = _use(monkeypatch, FakeProvider([inf_frame, fresh]))
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+
+    with pytest.raises(NoMarketDataError):
+        market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    assert market._range_cache.get(key, clock["t"]) is None  # nothing cached
+
+    out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    assert provider.count == 2
+    assert "205.00" in out and "inf" not in out.lower()
+
+
+@pytest.mark.unit
+def test_r7_mixed_inf_range_no_inf_cold_or_warm(clock, monkeypatch):
+    """Mixed data keeps valid rows usable and never emits ±inf, cold or warm."""
+
+    mixed = _frame([("2026-01-02", 100.0), ("2026-01-05", float("inf")),
+                    ("2026-01-06", 102.0)])
+    provider = _use(monkeypatch, FakeProvider([mixed]))
+
+    cold = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    warm = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+
+    assert provider.count == 1  # warm served from cache
+    for out in (cold, warm):
+        assert "inf" not in out.lower()  # no inf / -inf in CSV
+        assert "100.00" in out and "102.00" in out  # valid finite rows usable
+
+
+@pytest.mark.unit
+def test_r8_normal_range_output_byte_identical(clock, monkeypatch):
+    """Normal finite data keeps byte-for-byte CSV output (regression guard)."""
+    provider = _use(monkeypatch, FakeProvider([_frame(
+        [("2026-01-02", 105.0), ("2026-01-05", 106.0), ("2026-01-06", 107.5)])]))
+    cold = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    warm = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+    assert cold == EXPECTED_CACHE_OFF
+    assert warm == EXPECTED_CACHE_OFF
+    assert provider.count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Regression: combined refresh — two forced callers over an ordinary recheck
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.unit
+def test_r9_combined_refresh_two_forced_over_ordinary_recheck_one_load(clock, monkeypatch):
+    """Combined case: an ordinary request resolves from the cache recheck while
+    TWO refresh=True callers have joined its flight; one forced caller's re-entry
+    is held (bounded event) until the other has finished its provider reload.
+
+    Asserts the ordinary caller got the cached value, both forced callers got the
+    SAME fresh value, all finished, and the provider was called exactly once. A
+    separate forced request after completion still triggers a new load.
+
+    All synchronization is bounded events; every wait happens outside the cache
+    and flight locks (the provider and the re-entry gate wait before returning
+    into run(), never while a lock is held).
+    """
+    res, err, calls = _run_combined_refresh(monkeypatch, clock, reload_result="fresh")
+
+    assert err == {}
+    assert "2026-01-02,100.00,110.00,90.00,100.00" in res["ord"]  # ordinary: cached
+    assert "999.00" in res["A"] and "999.00" in res["B"]           # both: same fresh
+    assert res["A"] == res["B"]
+    assert len(calls) == 1                                          # one provider load
+
+    # A separate forced request after completion starts a NEW load.
+    before = len(calls)
+    out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+    assert len(calls) == before + 1
+    assert "999.00" in out
+
+
+@pytest.mark.unit
+def test_r10_combined_refresh_shares_follow_up_error(clock, monkeypatch):
+    """When the shared follow-up refresh fails, BOTH forced callers receive the
+    same provider error (the follow-up's error is reachable through the original
+    flight), and there was exactly one provider call for the follow-up."""
+    from tradingagents.dataflows.errors import VendorUnavailableError
+
+    res, err, calls = _run_combined_refresh(monkeypatch, clock, reload_result="error")
+
+    # The ordinary caller still got its cached value; both forced callers failed
+    # with the same error type from the single shared follow-up load.
+    assert "ord" not in err and "2026-01-02,100.00,110.00,90.00,100.00" in res["ord"]
+    assert isinstance(err.get("A"), VendorUnavailableError)
+    assert isinstance(err.get("B"), VendorUnavailableError)
+    assert type(err["A"]) is type(err["B"])
+    assert len(calls) == 1  # one shared follow-up provider call
+
+
+def _run_combined_refresh(monkeypatch, clock, *, reload_result):
+    """Drive the ordinary-recheck + two-forced-refresh interaction deterministically.
+
+    Returns (res, err, calls). ``reload_result`` is "fresh" (999 frame) or "error"
+    (the follow-up provider call raises VendorUnavailableError). B's re-entry is
+    held until A's reload completes, using bounded events only.
+    """
+    from tradingagents.dataflows.errors import VendorUnavailableError
+
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    old = _frame([("2026-01-02", 100.0), ("2026-01-05", 101.0), ("2026-01-06", 102.0)])
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    calls = []
+    reload_entered = threading.Event()   # a real (follow-up) provider load began
+    reload_release = threading.Event()   # let it return (fresh or error)
+
+    class Prov:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, **kw):
+            calls.append(1)
+            reload_entered.set()
+            assert reload_release.wait(5), "provider reload never released"
+            if reload_result == "error":
+                raise VendorUnavailableError("boom")
+            return fresh.copy()
+
+    # Ordinary request's get: pre-flight miss, then in-flight recheck hit (cached
+    # OLD frame, no provider call). Gated so both forced callers join first.
+    real_get = market._range_cache.get
+    tls = threading.local()
+    recheck_gate = threading.Event()
+    ordinary_at_recheck = threading.Event()  # set once the ordinary hits its recheck
+
+    def controlled_get(k, now):
+        if k != key or threading.current_thread().name.startswith("forced"):
+            return real_get(k, now)
+        phase = getattr(tls, "phase", 0)
+        tls.phase = phase + 1
+        if phase == 0:
+            return None  # ordinary pre-flight miss
+        if phase == 1:
+            ordinary_at_recheck.set()
+            assert recheck_gate.wait(5), "recheck gate never released"
+            return old.copy()  # recheck hit -> loaded=False
+        return real_get(k, now)
+
+    monkeypatch.setattr(market._range_cache, "get", controlled_get)
+    monkeypatch.setattr(market.yf, "Ticker", Prov)
+
+    # Hold forced caller B's RE-ENTRY until A's reload has completed and A has
+    # returned (its flight settled), so B must resume late. The re-entry is the
+    # nested run() call (call depth >= 2 on the same thread), so track per-thread
+    # depth. Bounded event; the wait is outside the cache/flight lock.
+    real_run = market._range_inflight.run
+    a_done = threading.Event()
+
+    def wrapping_run(*args, **kwargs):
+        depth = getattr(tls, "run_depth", 0)
+        tls.run_depth = depth + 1
+        try:
+            if threading.current_thread().name == "forcedB" and depth >= 1:
+                # B's re-entry (nested): wait until A finished and popped its flight.
+                assert a_done.wait(5), "forced A never finished"
+            return real_run(*args, **kwargs)
+        finally:
+            tls.run_depth = depth
+
+    monkeypatch.setattr(market._range_inflight, "run", wrapping_run)
+
+    res, err = {}, {}
+
+    def ordinary():
+        tls.phase = 0
+        try:
+            res["ord"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+        except BaseException as exc:  # noqa: BLE001
+            err["ord"] = exc
+
+    def forced_a():
+        try:
+            res["A"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err["A"] = exc
+        a_done.set()
+
+    def forced_b():
+        try:
+            res["B"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err["B"] = exc
+
+    t_ord = threading.Thread(target=ordinary, name="ord")
+    t_a = threading.Thread(target=forced_a, name="forcedA")
+    t_b = threading.Thread(target=forced_b, name="forcedB")
+
+    t_ord.start()
+    # Ordinary reaches its gated recheck (pre-flight miss already recorded).
+    assert ordinary_at_recheck.wait(5)
+    t_a.start()
+    t_b.start()
+    # Both forced callers joined the ordinary (recheck-only) flight.
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) == 2)
+    recheck_gate.set()          # ordinary resolves from the cache recheck (loaded=False)
+    assert reload_entered.wait(5)  # a follow-up provider reload has started
+
+    t_ord.join(5)               # ordinary returns its cached value
+    reload_release.set()        # let the follow-up reload finish (fresh or error)
+    t_a.join(6)                 # A completes; a_done set -> B may resume
+    t_b.join(6)
+
+    monkeypatch.setattr(market._range_cache, "get", real_get)
+    monkeypatch.setattr(market._range_inflight, "run", real_run)
+
+    assert not (t_ord.is_alive() or t_a.is_alive() or t_b.is_alive())
+    return res, err, calls
+
+
+@pytest.mark.unit
+def test_r11_follow_up_reuses_active_same_key_load(clock, monkeypatch):
+    """Occupied-key ordering: an ordinary flight resolves from cache; the original
+    forced waiter is held before follow-up selection while a NEW same-key forced
+    request starts and blocks in the provider. When the original waiter resumes
+    (provider call still active) it must REUSE that active flight, not start a
+    second load.
+
+    Asserts both forced callers get the same fresh data, exactly one provider
+    call, the key is freed afterward, and a separate later refresh loads anew.
+    Bounded events only; all waits are outside cache/flight locks.
+    """
+    key = market.range_cache_key("AAPL", "yahoo", "ohlcv", "2026-01-02", "2026-01-07")
+    old = _frame([("2026-01-02", 100.0), ("2026-01-05", 101.0), ("2026-01-06", 102.0)])
+    fresh = _frame([("2026-01-02", 999.0), ("2026-01-05", 1000.0), ("2026-01-06", 1001.0)])
+    calls = []
+    provider_entered = threading.Event()
+    provider_release = threading.Event()
+
+    class Prov:
+        def __init__(self, symbol):
+            pass
+
+        def history(self, **kw):
+            calls.append(1)
+            provider_entered.set()
+            assert provider_release.wait(5), "provider never released"
+            return fresh.copy()
+
+    # Ordinary request's get: pre-flight miss, then gated in-flight recheck hit.
+    real_get = market._range_cache.get
+    tls = threading.local()
+    recheck_gate = threading.Event()
+    ordinary_at_recheck = threading.Event()
+
+    def controlled_get(k, now):
+        if k != key or threading.current_thread().name.startswith("forced"):
+            return real_get(k, now)
+        phase = getattr(tls, "phase", 0)
+        tls.phase = phase + 1
+        if phase == 0:
+            return None
+        if phase == 1:
+            ordinary_at_recheck.set()
+            assert recheck_gate.wait(5)
+            return old.copy()  # recheck hit -> loaded=False
+        return real_get(k, now)
+
+    monkeypatch.setattr(market._range_cache, "get", controlled_get)
+    monkeypatch.setattr(market.yf, "Ticker", Prov)
+
+    # Hold forced A at follow-up selection until C's provider call is active.
+    real_join = market._range_inflight._join_follow_up
+    c_active = threading.Event()
+
+    def gated_join(k, original, loader, postprocess, timeout):
+        if threading.current_thread().name == "forcedA":
+            assert c_active.wait(5), "new forced request never reached the provider"
+        return real_join(k, original, loader, postprocess, timeout)
+
+    monkeypatch.setattr(market._range_inflight, "_join_follow_up", gated_join)
+
+    res, err = {}, {}
+
+    def ordinary():
+        tls.phase = 0
+        try:
+            res["ord"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06")
+        except BaseException as exc:  # noqa: BLE001
+            err["ord"] = exc
+
+    def forced_a():
+        try:
+            res["A"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err["A"] = exc
+
+    def forced_c():
+        try:
+            res["C"] = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+        except BaseException as exc:  # noqa: BLE001
+            err["C"] = exc
+
+    t_ord = threading.Thread(target=ordinary, name="ord")
+    t_ord.start()
+    assert ordinary_at_recheck.wait(5)
+    # A joins the ordinary (recheck-only) flight first.
+    t_a = threading.Thread(target=forced_a, name="forcedA")
+    t_a.start()
+    assert _wait_until_lambda(lambda: market._range_inflight.waiter_count(key) == 1)
+    recheck_gate.set()  # ordinary resolves from the cache recheck
+
+    # C: a separate same-key forced request starts and blocks in the provider.
+    t_c = threading.Thread(target=forced_c, name="forcedC")
+    t_c.start()
+    assert provider_entered.wait(5), "new forced request never entered provider"
+    c_active.set()  # let A resume at follow-up selection, provider still active
+
+    provider_release.set()
+    t_ord.join(6)
+    t_a.join(6)
+    t_c.join(6)
+
+    monkeypatch.setattr(market._range_cache, "get", real_get)
+    monkeypatch.setattr(market._range_inflight, "_join_follow_up", real_join)
+
+    assert err == {}
+    assert not (t_ord.is_alive() or t_a.is_alive() or t_c.is_alive())
+    assert "2026-01-02,100.00,110.00,90.00,100.00" in res["ord"]  # ordinary: cached
+    assert "999.00" in res["A"] and "999.00" in res["C"]           # both: same fresh
+    assert res["A"] == res["C"]
+    assert len(calls) == 1                                          # ONE provider load
+
+    # Cleanup left the key available for a separate later refresh -> a new load.
+    assert key not in market._range_inflight.inflight_keys()
+    before = len(calls)
+    out = market.get_YFin_data_online("AAPL", "2026-01-02", "2026-01-06", refresh=True)
+    assert len(calls) == before + 1
+    assert "999.00" in out

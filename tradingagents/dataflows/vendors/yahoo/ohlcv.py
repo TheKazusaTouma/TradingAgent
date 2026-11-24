@@ -118,6 +118,29 @@ def _coerce_ohlcv_dates(data: pd.DataFrame) -> pd.Series:
     return pd.Series(dtype="datetime64[ns]")
 
 
+def _row_aligned_dates_and_closes(data: pd.DataFrame):
+    """Row-aligned (normalized dates, numeric closes) for a frame, or ``None``.
+
+    The date may be a ``Date``/``Datetime``/``date`` column (the cached CSV and a
+    reset-index download) or a ``DatetimeIndex`` (a raw yfinance ``history()``
+    frame, which the date-range path passes straight through). Aligning dates and
+    closes by position keeps the per-row check correct in both shapes. Returns
+    ``None`` when the frame has no Close or no date source.
+    """
+    if data is None or data.empty or "Close" not in data.columns:
+        return None
+    frame = _ensure_date_column(data)
+    if "Date" in frame.columns:
+        raw_dates = frame["Date"].reset_index(drop=True)
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        raw_dates = pd.Series(frame.index).reset_index(drop=True)
+    else:
+        return None
+    dates = _normalize_dates(raw_dates).reset_index(drop=True)
+    closes = pd.to_numeric(frame["Close"], errors="coerce").astype("float64").reset_index(drop=True)
+    return dates, closes
+
+
 def _has_usable_bar(data: pd.DataFrame) -> bool:
     """Whether a frame holds at least one row with both a parseable date and a
     finite numeric close.
@@ -128,16 +151,30 @@ def _has_usable_bar(data: pd.DataFrame) -> bool:
     only whether the content is worth storing/serving, not whether it covers a
     particular date.
     """
-    if data is None or data.empty or "Close" not in data.columns:
+    aligned = _row_aligned_dates_and_closes(data)
+    if aligned is None:
         return False
-    frame = _ensure_date_column(data)
-    if "Date" not in frame.columns:
-        return False
-    dates = _normalize_dates(frame["Date"])
-    closes = pd.to_numeric(frame["Close"], errors="coerce").astype("float64")
+    dates, closes = aligned
     # A finite close only: ±inf and NaN are not usable prices.
     usable = dates.notna() & np.isfinite(closes)
     return bool(usable.any())
+
+
+def _latest_usable_date(data: pd.DataFrame):
+    """The latest date whose row carries both a parseable date and a finite close.
+
+    Used to judge freshness on real, usable data: a recent row whose close is
+    ±inf is not a real latest quote, so the newest finite bar decides staleness.
+    Returns a normalised ``pd.Timestamp`` or ``pd.NaT`` when no usable row exists.
+    """
+    aligned = _row_aligned_dates_and_closes(data)
+    if aligned is None:
+        return pd.NaT
+    dates, closes = aligned
+    usable = dates.notna() & np.isfinite(closes)
+    if not usable.any():
+        return pd.NaT
+    return dates[usable].max().normalize()
 
 
 def _read_cached_csv(data_file: str):
@@ -189,6 +226,52 @@ def _assert_ohlcv_not_stale(
             symbol,
             canonical,
             f"latest row is {latest.date()}, {stale_days} days before the "
+            f"requested {requested.date()} (stale) — refusing to use it",
+        )
+
+
+def _assert_range_usable_and_fresh(
+    data: pd.DataFrame,
+    end_date: str,
+    symbol: str,
+    canonical: str | None = None,
+    *,
+    max_stale_days: int = MAX_OHLCV_STALE_DAYS,
+) -> None:
+    """Validate a date-range download before it is stored or returned.
+
+    The frame is usable only if it holds at least one row with both a parseable
+    date and a finite close, and its latest *usable* row (finite close) is within
+    ``max_stale_days`` of ``end_date``. A recent row whose close is ±inf does not
+    count as the latest quote, so an old finite bar behind an infinite tail is
+    still judged stale. Raises ``NoMarketDataError`` otherwise so the caller never
+    caches or serves an unusable/old frame. This performs no output transformation
+    (no column renames, no row dropping); it only inspects the frame.
+    """
+    if data is None or data.empty:
+        raise NoMarketDataError(
+            symbol, canonical, f"no rows between {end_date} and {end_date}"
+        )
+    if not _has_usable_bar(data):
+        raise NoMarketDataError(
+            symbol, canonical,
+            f"no usable closing prices between {end_date} and {end_date}",
+        )
+    requested = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(requested):
+        return
+    latest = _latest_usable_date(data)
+    if pd.isna(latest):
+        raise NoMarketDataError(
+            symbol, canonical,
+            f"no usable closing prices between {end_date} and {end_date}",
+        )
+    stale_days = (requested.normalize() - latest).days
+    if stale_days > max_stale_days:
+        raise NoMarketDataError(
+            symbol,
+            canonical,
+            f"latest usable row is {latest.date()}, {stale_days} days before the "
             f"requested {requested.date()} (stale) — refusing to use it",
         )
 
@@ -261,13 +344,13 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
         # can serve from, avoiding a second download.
         inflight_key = (os.path.abspath(config["data_cache_dir"]), safe_symbol)
 
-        def _load() -> pd.DataFrame:
+        def _load() -> tuple[pd.DataFrame, bool]:
             if os.path.exists(data_file):
                 recheck = _read_cached_csv(data_file)
                 if recheck is not None and _cache_is_fresh(data_file, as_of_dt, now):
                     # Served from disk without a provider call: a disk hit.
                     STATS.incr("disk_hits")
-                    return recheck
+                    return recheck, False
 
             # yf.download catches every error, a rate limit included, and returns
             # an empty frame. Ticker.history raises the rate limit, so it is retried.
@@ -297,7 +380,7 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
                     data_file,
                     lambda temp: downloaded.to_csv(temp, index=False, encoding="utf-8"),
                 )
-                return downloaded
+                return downloaded, True
             except BaseException:
                 # A shared load failure is counted once (only the leader runs
                 # this loader), never once per waiting caller.

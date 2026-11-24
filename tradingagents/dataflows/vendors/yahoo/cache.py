@@ -157,13 +157,23 @@ class _Flight:
     The leader (the caller that created the flight) runs the load and records
     its outcome here; followers block on ``done`` and then copy ``result`` or
     re-raise ``error``. ``waiters`` counts followers currently parked on the
-    flight, so a test can confirm a second caller actually joined it.
+    flight, so a test can confirm a second caller actually joined it. ``loaded``
+    is True only when the leader actually invoked the data source; a leader that
+    resolved from a cache recheck leaves it False.
+
+    ``follow_up`` links a forced refresh to the cache-only flight it abandoned:
+    when an ordinary flight resolves from a cache recheck, the forced callers
+    that joined it share ONE follow-up flight (created on demand and attached
+    here), so a late resumer can still reach that follow-up's result or error
+    through the original flight instead of starting a fresh load.
     """
 
     done: threading.Event = field(default_factory=threading.Event)
     result: pd.DataFrame | None = None
     error: BaseException | None = None
     waiters: int = 0
+    loaded: bool = False
+    follow_up: _Flight | None = None
 
 
 class _Inflight:
@@ -182,14 +192,24 @@ class _Inflight:
         # Followers recorded here count even if they get the shared result or error.
         self._stats = stats if stats is not None else STATS
 
-    def run(self, key: tuple, loader, postprocess=None, *, timeout: float | None = None):
+    def run(self, key: tuple, loader, postprocess=None, *, timeout: float | None = None,
+            require_fresh: bool = False):
         """Run ``loader()`` once per key across concurrent callers.
 
-        ``loader`` returns the raw frame; ``postprocess`` (optional) turns that
-        raw frame into this caller's result and is applied to a per-caller copy
-        so callers can keep distinct date cutoffs / gap handling. On the first
-        (leader) call the load runs inline; followers wait up to ``timeout``.
-        A leader failure propagates to every follower.
+        ``loader`` returns ``(frame, loaded)``: ``loaded`` is True only when the
+        loader actually called the data source (False when it resolved from a
+        cache recheck). ``postprocess`` (optional) turns the raw frame into this
+        caller's result on a per-caller copy. On the first (leader) call the load
+        runs inline; followers wait up to ``timeout``. A leader failure
+        propagates to every follower.
+
+        ``require_fresh`` (a forced refresh): if this caller joins a flight whose
+        leader resolved *only* from a cache recheck (``loaded`` False), it must
+        not accept that cached result. Instead the forced callers that joined that
+        flight share ONE follow-up flight, attached to the original flight so a
+        late resumer still reaches the same result/error (never a fresh load while
+        a sibling follow-up exists). The follow-up runs ``loader`` (which, being
+        forced, does a real provider load) with same-key coalescing preserved.
         """
         with self._lock:
             flight = self._flights.get(key)
@@ -201,14 +221,7 @@ class _Inflight:
                 flight.waiters += 1
 
         if not leader:
-            # A follower joined an existing flight: count it as a coalesced wait
-            # regardless of whether it later receives the result or the error.
             self._stats.incr("coalesced_waits")
-            # The follower registered itself above; always unregister, whether it
-            # wakes normally or times out. A timed-out follower must not leave
-            # the flight registered with a stale waiter count — the flight stays
-            # in ``_flights`` for the still-running leader and any later caller
-            # to join, but this follower is no longer waiting on it.
             try:
                 finished = flight.done.wait(timeout)
             finally:
@@ -218,23 +231,88 @@ class _Inflight:
                 raise TimeoutError(f"timed out waiting for in-flight load {key!r}")
             if flight.error is not None:
                 raise flight.error
+            # A forced caller must not accept a result the leader served from a
+            # cache recheck (loaded=False). Join (or lead) the single follow-up
+            # tied to this flight rather than starting an independent load.
+            if require_fresh and not flight.loaded:
+                return self._join_follow_up(key, flight, loader, postprocess, timeout)
             result = flight.result.copy()
             return postprocess(result) if postprocess else result
 
-        # Leader: load outside the lock so other keys are not blocked.
+        return self._lead(key, flight, loader, postprocess)
+
+    def _lead(self, key: tuple, flight: _Flight, loader, postprocess):
+        """Run ``loader`` as ``flight``'s leader (outside the lock)."""
         try:
-            result = loader()
+            result, loaded = loader()
         except BaseException as exc:  # noqa: BLE001 — released to every waiter as-is
             with self._lock:
                 flight.error = exc
-                self._flights.pop(key, None)
+                # Only remove if this exact flight still owns the key (a follow-up
+                # may have replaced it); else leave the newer one in place.
+                if self._flights.get(key) is flight:
+                    self._flights.pop(key, None)
                 flight.done.set()
             raise
         with self._lock:
             flight.result = result.copy()
-            self._flights.pop(key, None)
+            flight.loaded = loaded
+            if self._flights.get(key) is flight:
+                self._flights.pop(key, None)
             flight.done.set()
         return postprocess(result.copy()) if postprocess else result
+
+    def _join_follow_up(self, key, original: _Flight, loader, postprocess, timeout):
+        """Join or lead the single follow-up refresh tied to ``original``.
+
+        Created on demand under the lock and linked via ``original.follow_up`` so
+        every forced caller that abandoned ``original`` shares one follow-up (its
+        result *or* error), and a late resumer reaches it instead of reloading.
+
+        If another same-key provider load already owns the key (e.g. a separate
+        forced request started first and is blocked in the provider), reuse *that*
+        active flight instead of starting a parallel follow-up load: the follow-up
+        is pointed at it and this caller waits on it. That keeps one provider call
+        per key and leaves cleanup to the flight's own leader.
+        """
+        with self._lock:
+            follow = original.follow_up
+            leader = follow is None
+            if leader:
+                existing = self._flights.get(key)
+                if existing is not None:
+                    # A same-key load is already in progress: share it rather than
+                    # load in parallel. Link it as this flight's follow-up so late
+                    # resumers reach the same outcome, and join as a follower.
+                    original.follow_up = existing
+                    existing.waiters += 1
+                    follow = existing
+                    leader = False
+                else:
+                    follow = _Flight()
+                    original.follow_up = follow
+                    # Register the follow-up under the key so a brand-new same-key
+                    # caller coalesces onto the in-progress refresh instead of
+                    # loading in parallel (same-key coalescing preserved).
+                    self._flights[key] = follow
+            else:
+                follow.waiters += 1
+
+        if not leader:
+            self._stats.incr("coalesced_waits")
+            try:
+                finished = follow.done.wait(timeout)
+            finally:
+                with self._lock:
+                    follow.waiters -= 1
+            if not finished:
+                raise TimeoutError(f"timed out waiting for follow-up load {key!r}")
+            if follow.error is not None:
+                raise follow.error
+            result = follow.result.copy()
+            return postprocess(result) if postprocess else result
+
+        return self._lead(key, follow, loader, postprocess)
 
     def waiter_count(self, key: tuple) -> int:
         """Followers currently waiting on ``key`` (test/debug hook)."""

@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from typing import Annotated
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
@@ -17,7 +18,10 @@ from tradingagents.dataflows.vendors.yahoo.cache import (
     range_cache_key,
 )
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
-from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
+from tradingagents.dataflows.vendors.yahoo.ohlcv import (
+    _assert_range_usable_and_fresh,
+    load_ohlcv,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +70,15 @@ def get_YFin_data_online(
         # Coalesce concurrent identical misses into one provider load. The
         # loader rechecks the cache first, so a request that loses the race but
         # arrives after another already stored the frame is served from it.
-        def _load() -> pd.DataFrame:
+        # A forced caller joining a recheck-only flight is pushed back through
+        # this same loading path (see _Inflight.run's require_fresh) so it still
+        # obtains provider data without a separate refresh namespace.
+        def _load() -> tuple[pd.DataFrame, bool]:
             cached = None if refresh else _range_cache.get(key, _now())
             if cached is not None:
                 # Served from memory inside the flight (the race was lost): a hit.
                 STATS.incr("memory_hits")
-                return cached
+                return cached, False
             # One load attempt per shared load, before the provider is invoked,
             # so yf_retry's internal retries are not counted separately.
             STATS.incr("load_attempts")
@@ -87,16 +94,22 @@ def get_YFin_data_online(
                 if loaded is None or loaded.empty:
                     raise_for_empty(symbol, canonical, f"rows between {start_date} and {end_date}")
 
-                # Store only after the load succeeded; cache.store keeps its own copy.
+                # Validate the raw download BEFORE storing it or handing it to the
+                # waiting callers: a stale frame, or one with no usable finite close,
+                # must never enter the success cache or a shared result.
+                _assert_range_usable_and_fresh(loaded, end_date, symbol, canonical)
+
+                # Store only after the load succeeded and validated; cache.store
+                # keeps its own copy.
                 _range_cache.store(key, loaded, _now())
-                return loaded
+                return loaded, True
             except BaseException:
                 # A shared load failure is counted once (only the leader runs this
                 # loader), not once per waiting caller.
                 STATS.incr("load_failures")
                 raise
 
-        data = _range_inflight.run(key, _load)
+        data = _range_inflight.run(key, _load, require_fresh=refresh)
     # On a hit (cache or shared in-flight) this caller holds an independent copy,
     # so ``data`` is safe to format in place below.
 
@@ -104,10 +117,18 @@ def get_YFin_data_online(
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
 
-    # Reject a stale frame (e.g. a year-old partial response) before it is
-    # formatted into the report. Raises NoMarketDataError, which the router
-    # turns into one clear unavailable signal (#1021).
-    _assert_ohlcv_not_stale(data, end_date, symbol, canonical)
+    # Coerce non-finite closes (±inf) to missing so they render as empty rather
+    # than "inf" in the CSV. The date index and column layout are untouched, and
+    # no OHLCV-only transformation (row dropping, column renames) is applied.
+    for col in ("Open", "High", "Low", "Close", "Adj Close"):
+        if col in data.columns:
+            numeric = pd.to_numeric(data[col], errors="coerce").astype("float64")
+            data[col] = numeric.where(np.isfinite(numeric))
+
+    # Defense in depth for the warm (cache-hit) path too: reject a frame with no
+    # usable finite close, or one whose latest usable row is stale, before
+    # formatting. Fresh loads were already validated before being stored.
+    _assert_range_usable_and_fresh(data, end_date, symbol, canonical)
 
     for col in ("Open", "High", "Low", "Close", "Adj Close"):
         if col in data.columns:

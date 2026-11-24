@@ -525,7 +525,7 @@ def test_c9_timed_out_follower_keeps_flight_and_later_caller_joins_it(monkeypatc
         loader_calls.append("leader")
         leader_entered.set()
         assert leader_release.wait(JOIN_TIMEOUT)
-        return pd.DataFrame({"Close": [105.0]})
+        return pd.DataFrame({"Close": [105.0]}), True
 
     t_leader = threading.Thread(target=lambda: inflight.run(key, leader))
     t_leader.start()
@@ -545,7 +545,7 @@ def test_c9_timed_out_follower_keeps_flight_and_later_caller_joins_it(monkeypatc
 
     def second_loader():
         loader_calls.append("second")  # must NOT run
-        return pd.DataFrame({"Close": [999.0]})
+        return pd.DataFrame({"Close": [999.0]}), True
 
     def late_caller():
         late_result["frame"] = inflight.run(key, second_loader, timeout=JOIN_TIMEOUT)
