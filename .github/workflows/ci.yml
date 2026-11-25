@@ -65,3 +65,131 @@ jobs:
         # The repo is fully clean under the strict select, so we lint everything
         # (generated results/ is excluded via pyproject extend-exclude).
         run: ruff check .
+
+  # --- Course governance gates ------------------------------------------------
+  # These jobs are the required-check candidates for branch protection. Their
+  # job "name" values are the check names to require (see docs/course-ci-gates.md):
+  #   requirements-schema
+  #   type-check (scoped)
+  #   dependency-check
+  #   security-checks (scoped)
+  #   offline-eval-replay
+  #   ai-use-log
+  # Configuring branch protection itself is a separate, manual GitHub step and is
+  # not done by this workflow.
+
+  requirements-schema:
+    name: requirements-schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install validation + test dependencies (pinned)
+        # pytest is installed explicitly: do not assume it is preinstalled on the
+        # runner. PyYAML/jsonschema are what the validator and its tests import.
+        run: python -m pip install "pytest==8.3.3" "PyYAML==6.0.2" "jsonschema==4.23.0"
+      - name: Validate requirements against schema; check duplicate IDs and dependencies
+        run: python -m tools.check_requirements
+      - name: Test the validators themselves
+        run: python -m pytest -q tests/test_check_requirements.py --noconftest
+
+  type-check:
+    name: type-check (scoped)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install project + pinned mypy (3.12 only)
+        # mypy is NOT in the common dev extra: it is only needed by this gate, so it
+        # is installed here explicitly and pinned, keeping the 3.11-3.14 test matrix
+        # free of it. If this install fails, the job fails (the gate cannot be skipped).
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "mypy==1.11.2"
+      - name: Scoped type check
+        # Scope, flags and the documented type debt are defined in tools/ci_checks.py.
+        # `tools.ci_checks type` exits non-zero (2) when mypy is unavailable, so a
+        # missing mypy fails the gate rather than silently passing.
+        run: python -m tools.ci_checks type
+
+  dependency-check:
+    name: dependency-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: pip check (broken/conflicting installed requirements)
+        run: python -m tools.ci_checks deps
+
+  security-checks:
+    name: security-checks (scoped)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install test dependency (pinned)
+        # pytest installed explicitly; tools.ci_checks imports no third-party
+        # module at import time, so no other dependency is needed for its tests.
+        run: python -m pip install "pytest==8.3.3"
+      - name: Scoped security scan (patterns + committed key/cert files)
+        run: python -m tools.ci_checks security
+      - name: Test the security checks themselves
+        run: python -m pytest -q tests/test_ci_checks.py --noconftest
+
+  offline-eval-replay:
+    name: offline-eval-replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Fixed offline evaluation replay (scripted models, no network)
+        # Runs unconditionally for reliability: a prompt/model regression is caught
+        # regardless of which PR introduced it.
+        run: python -m tools.eval_replay
+
+  ai-use-log:
+    name: ai-use-log
+    runs-on: ubuntu-latest
+    # pull_request (NOT pull_request_target): the workflow runs against the PR's
+    # own merge ref with a read-only token and no secrets. Base/head SHAs come
+    # from the event payload and are compared with local git only.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install log-check + test dependencies (pinned)
+        # pytest and PyYAML installed explicitly (log check and its tests use both).
+        run: python -m pip install "pytest==8.3.3" "PyYAML==6.0.2"
+      - name: Check AI-use log update on code/prompt/model changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python -m tools.ai_use_log --base "$BASE_SHA" --head "$HEAD_SHA"
+      - name: Test the log check itself
+        run: python -m pytest -q tests/test_ai_use_log.py --noconftest
