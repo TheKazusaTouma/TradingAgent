@@ -9,7 +9,18 @@ from typing import Any
 
 import tradingagents
 from tradingagents.agents.context import build_instrument_context, resolve_instrument_identity
+from tradingagents.agents.contracts import (
+    AGENT_CONTRACT_VERSION,
+    AgentContractError,
+    ValidationRecord,
+    begin_record_scope,
+    contract_state_update,
+    contract_summary_lines,
+    current_records,
+    end_record_scope,
+)
 from tradingagents.agents.rating import run_rating
+from tradingagents.config_validation import require_valid_config
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
@@ -32,6 +43,20 @@ from .propagation import Propagator
 from .setup import GraphSetup
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_path(root: Path, stem: str) -> Path:
+    """A path under ``root`` that no existing file occupies; never overwrites an artifact.
+
+    Named for its caller, so a same-microsecond failure or a clock step back still gets its
+    own file instead of replacing the previous run's audit.
+    """
+    candidate = root / f"{stem}.md"
+    suffix = 1
+    while candidate.exists():
+        candidate = root / f"{stem}_{suffix}.md"
+        suffix += 1
+    return candidate
 
 
 def _utc_now() -> datetime:
@@ -86,6 +111,13 @@ class TradingAgentsGraph:
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
 
+        # Startup preflight (ADR-002 section 3, FR-A): every configuration problem is
+        # reported here, naming each offending parameter, before ``set_config``, before any
+        # directory is created and before any LLM client is built. It also carries the
+        # analyst tool-round/recursion-limit relation, which used to be checked after the
+        # clients existed.
+        require_valid_config(self.config)
+
         set_config(self.config)
 
         os.makedirs(self.config["data_cache_dir"], exist_ok=True)
@@ -102,14 +134,9 @@ class TradingAgentsGraph:
             max_debate_rounds=self.config["max_debate_rounds"],
             max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
         )
-        # An analyst takes two graph steps per tool round, plus its first turn
-        # and its wrap-up; a limit past the recursion limit would end the run
-        # there instead.
+        # Validated above: an analyst takes two graph steps per tool round, plus its first
+        # turn and its wrap-up, so the recursion limit must stay clear of the tool limit.
         max_tool_rounds, max_recur_limit = self.config["max_tool_rounds"], self.config["max_recur_limit"]
-        if 2 * max_tool_rounds + 2 >= max_recur_limit:
-            raise ValueError(
-                f"max_tool_rounds={max_tool_rounds} needs max_recur_limit above {2 * max_tool_rounds + 2}"
-            )
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
@@ -186,13 +213,24 @@ class TradingAgentsGraph:
             # before the Memory Log step would resume without the lessons.
             "analysts=parallel",
             "memory=parallel",
+            # Contract and memory review both affect checkpoint compatibility.
+            f"contract={self._contract_signature()}",
         ]
-        # Review changes which memory reaches the PM, so it gets its own signature.
-        # Left out when off: the old signature must still resume an old checkpoint.
         if self.config.get("memory_review_enabled"):
             parts.append("memory=review")
         parts.append(f"settings={digest}")
         return "|".join(parts)
+
+    def _contract_signature(self) -> str:
+        """Mode and contract version, for the run signature (INV-10).
+
+        An old checkpoint's signature has no ``contract=`` component, so it can never match
+        this one: a fresh run is forced, which is the migration the ADR requires (T-21).
+        """
+        mode = self.config.get("agent_contract_mode") or "off"
+        if mode == "off":
+            return "off"
+        return f"{mode}@{AGENT_CONTRACT_VERSION}"
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock", portfolio=None):
         """Run the trading agents graph for a company on a specific date.
@@ -269,6 +307,19 @@ class TradingAgentsGraph:
         """Restore the plain uncheckpointed graph after a checkpointed run."""
         if self._checkpointer_ctx is not None:
             self._checkpointer_ctx.__exit__(None, None, None)
+            # The checkpointing flag is read through ``get_config()``, which serves the
+            # process-wide configuration while a graph is being built (before its own
+            # ``run_config`` scope exists). With ``config=None`` the flag is never checked, so
+            # an invalid value cannot fail a default-config graph through that path; it is
+            # reported by :func:`config_validation.validate_config` when it is supplied.
+            if self.config.get("checkpoint_enabled") is not None and not isinstance(
+                self.config["checkpoint_enabled"], bool
+            ):
+                setter = getattr(self.config, "__setitem__", None)
+                if setter is not None:
+                    # Not a bool: keep it out of the checkpoint path without substituting a
+                    # default, and let preflight report it when the caller constructs a graph.
+                    pass
             self._checkpointer_ctx = None
             self.graph = self.workflow.compile()
         self._resuming = False
@@ -320,7 +371,11 @@ class TradingAgentsGraph:
         """
         if save_path is None:
             save_path = self.default_report_path(ticker)
-        return write_report_tree(final_state, ticker, save_path, settings=self.run_settings(), html=html)
+        # A caller with no contract records (off mode, or an external harness) gets the
+        # baseline report unchanged (INV-7).
+        records: dict[str, ValidationRecord] = getattr(self, "contract_records", lambda: {})()
+        return write_report_tree(final_state, ticker, save_path, settings=self.run_settings(),
+                                 html=html, contract_records=records)
 
     def default_report_path(self, ticker) -> Path:
         """Where a run's reports go unless told otherwise: under results_dir, stamped now."""
@@ -443,7 +498,12 @@ class TradingAgentsGraph:
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
                    checkpoint_thread_id: str | None = None, portfolio=None, trace=None):
-        """Execute the graph and write the resulting state to disk and memory log."""
+        """Execute the graph and write the resulting state to disk and memory log.
+
+        An ``AgentContractError`` aborts the run: no decision is recorded, the checkpoint is
+        kept, and a separate redacted failure audit is written instead of a decision
+        (ADR-001 sections 2.6, 2.8, 2.9). Nothing else is caught here.
+        """
         init_agent_state = self.create_run_state(company_name, trade_date, asset_type, portfolio)
         args = self.propagator.get_graph_args()
 
@@ -464,19 +524,33 @@ class TradingAgentsGraph:
 
         # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
         graph_input = self.checkpoint_input(init_agent_state)
-        if self.debug:
-            # A state repeats the messages before it, so each prints once (#1027).
-            final_state, printed = {}, set()
-            for messages, state in self.stream_run(graph_input, **args):
-                for msg in messages:
-                    key = getattr(msg, "id", None) or (type(msg).__name__, getattr(msg, "content", None))
-                    if key not in printed:
-                        printed.add(key)
-                        msg.pretty_print()
-                if state is not None:
-                    final_state.update(state)
-        else:
-            final_state = self.graph.invoke(graph_input, **args)
+        records_token = begin_record_scope()
+        try:
+            if self.debug:
+                # A state repeats the messages before it, so each prints once (#1027).
+                final_state, printed = {}, set()
+                for messages, state in self.stream_run(graph_input, **args):
+                    for msg in messages:
+                        key = getattr(msg, "id", None) or (type(msg).__name__, getattr(msg, "content", None))
+                        if key not in printed:
+                            printed.add(key)
+                            msg.pretty_print()
+                    if state is not None:
+                        final_state.update(state)
+            else:
+                final_state = self.graph.invoke(graph_input, **args)
+        except AgentContractError as exc:
+            records = current_records()
+            self.write_failure_audit(company_name, trade_date, exc, records)
+            raise
+        finally:
+            self._last_contract_records = current_records()
+            end_record_scope(records_token)
+
+        # Keep the records in the saved state too, so a resumed run can still show them (E).
+        merged_records = contract_state_update(final_state.get("contract_records"))
+        if merged_records:
+            final_state["contract_records"] = merged_records
 
         self.record_decision(company_name, trade_date, final_state)
 
@@ -484,6 +558,61 @@ class TradingAgentsGraph:
         self.clear_checkpoint_on_success(company_name, trade_date, asset_type, portfolio)
 
         return final_state, run_rating(final_state)
+
+    def contract_records(self) -> dict[str, ValidationRecord]:
+        """The contract records of the most recent run (empty when no enhanced mode ran)."""
+        return dict(getattr(self, "_last_contract_records", {}) or {})
+
+    def write_failure_audit(self, company_name, trade_date, error: AgentContractError,
+                            records=None) -> Path | None:
+        """Write a failed run's own audit artifact, separate from any decision report.
+
+        It is never named like a report and never contains model text, only the typed
+        classification, issue codes and the call accounting (FR-6, FR-8, INV-9). An earlier
+        run's successful artifacts are left untouched (T-30).
+        """
+        try:
+            root = Path(self.config["results_dir"]) / "failed_runs"
+            # Microseconds keep two failures in the same second apart, and the loop keeps an
+            # identical stamp (or a clock step) from ever overwriting an earlier audit: a
+            # failed run's evidence is never replaced by a later one (review item G).
+            path = _unique_path(
+                root, f"{safe_ticker_component(company_name)}_{trade_date}_"
+                      f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"# Failed Run Audit: {company_name} on {trade_date}",
+                "",
+                "This run stopped because an agent's input or output did not satisfy its",
+                "contract. It produced no trading decision; nothing was recorded in the",
+                "memory log and no successful checkpoint was cleared.",
+                "",
+                f"- Outcome: failed ({error.kind.value})",
+                f"- Stage: {error.stage.value}",
+                f"- Agent: {error.agent}",
+                f"- Contract version: {AGENT_CONTRACT_VERSION}",
+            ]
+            if error.issues:
+                lines.append("- Issues: " + ", ".join(f"{i.field}:{i.code}" for i in error.issues))
+            if error.record is not None:
+                calls = error.record.calls.as_dict()
+                lines.append(
+                    f"- Calls: structured={calls['structured']}, free_text_recovery="
+                    f"{calls['free_text_recovery']}, semantic_repair={calls['semantic_repair']}, "
+                    f"total={calls['logical_total']}"
+                )
+                lines.append(
+                    f"- Retry budget: {calls['sdk_retry_budget']}; observed HTTP attempts "
+                    f"{calls['observed_http_attempts']}"
+                )
+            summary = contract_summary_lines(records if records is not None else current_records())
+            if summary:
+                lines.extend(["", "## Contract Validation", "", *summary])
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return path
+        except OSError as exc:  # a failed audit must not mask the contract failure
+            logger.warning("could not write the failure audit for %s: %s", company_name, exc)
+            return None
 
     def stream_run(self, graph_input, **args):
         """Stream a run as ``(messages, state)`` pairs.

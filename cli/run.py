@@ -24,7 +24,14 @@ from cli.display import (
 )
 from cli.selections import depth_from_env, get_user_selections, unattended_gaps
 from cli.stats_handler import StatsCallbackHandler
+from tradingagents.agents.contracts import (
+    AgentContractError,
+    begin_record_scope,
+    current_records,
+    end_record_scope,
+)
 from tradingagents.agents.rating import is_review, run_rating
+from tradingagents.config_validation import require_valid_config
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
@@ -112,6 +119,9 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
     selections = get_user_selections(flags)
 
     config = _build_run_config(selections, checkpoint)
+
+    # Validate before constructing clients or creating a run directory.
+    require_valid_config(config)
 
     stats_handler = StatsCallbackHandler()
 
@@ -251,6 +261,7 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
             # interrupted run instead of re-appending the initial state (#1249); the
             # try/finally tears the checkpointer down even if the stream raises.
             trace = []
+            records_token = begin_record_scope()
             try:
                 for messages, chunk in graph.stream_run(graph.checkpoint_input(init_agent_state), **args):
                     for message in messages:
@@ -368,7 +379,21 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
                 graph.clear_checkpoint_on_success(
                     selections["ticker"], selections["analysis_date"], selections["asset_type"], portfolio
                 )
+            except AgentContractError as failure:
+                graph.write_failure_audit(
+                    selections["ticker"], selections["analysis_date"], failure
+                )
+                message_buffer.add_message(
+                    "System",
+                    f"Analysis stopped: the {failure.agent} output failed its contract "
+                    f"({failure.kind.value}, {failure.stage.value}). No decision was recorded; "
+                    "the run is not saved as a successful result.",
+                )
+                update_display(layout, stats_handler=stats_handler, start_time=start_time)
+                raise
             finally:
+                graph._last_contract_records = current_records()
+                end_record_scope(records_token)
                 # Always restore the plain uncheckpointed graph, even on failure.
                 graph.end_checkpoint()
 

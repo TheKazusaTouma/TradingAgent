@@ -1,5 +1,15 @@
 import os
 
+# The mode vocabulary is duplicated here on purpose: ``default_config`` is a leaf
+# module imported during ``tradingagents.dataflows`` initialisation, so importing
+# ``tradingagents.agents.contracts`` here would create an import cycle. The values
+# are asserted equal to the contract module's in
+# ``tests/test_agent_contracts.py`` (T-13), and the contract version is compared
+# the same way rather than imported.
+AGENT_CONTRACT_MODE_OFF = "off"
+AGENT_CONTRACT_MODES = ("off", "validate", "validate+repair")
+AGENT_CONTRACT_VERSION = "2"
+
 _TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
 
 # Single source of truth for env-var → config-key overrides. To expose
@@ -26,6 +36,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_TEMPERATURE":          "temperature",
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
+    "TRADINGAGENTS_AGENT_CONTRACT_MODE":  "agent_contract_mode",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -72,16 +83,37 @@ def _apply_env_overrides(config: dict) -> dict:
             config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
             raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
+    if "agent_contract_mode" in config:
+        config["agent_contract_mode"] = normalize_agent_contract_mode(config["agent_contract_mode"])
     return config
+
+
+def normalize_agent_contract_mode(value) -> str:
+    """Return a valid ``agent_contract_mode``, or raise ``ValueError``.
+
+    Mirrors ``tradingagents.agents.contracts.normalize_mode``; kept local to avoid
+    the import cycle described above. An unknown mode is a configuration error and
+    must fail at startup rather than silently running in the wrong mode.
+    """
+    text = AGENT_CONTRACT_MODE_OFF if value is None else str(value).strip().lower()
+    if text not in AGENT_CONTRACT_MODES:
+        raise ValueError(
+            f"agent_contract_mode must be one of {', '.join(AGENT_CONTRACT_MODES)}, got {value!r}"
+        )
+    return text
 
 
 def build_default_config() -> dict:
     """The built-in defaults with the TRADINGAGENTS_* environment folded in.
 
     Read when the package is imported, as DEFAULT_CONFIG; call it again to see
-    the environment as it is now.
+    the environment as it is now. The merged result is validated by the central
+    preflight (ADR-002 section 3), so a malformed ``TRADINGAGENTS_*`` value is
+    reported before any run starts, naming the variable's config key. The
+    import is local because ``tradingagents.config_validation`` imports this
+    module.
     """
-    return _apply_env_overrides({
+    config = _apply_env_overrides({
         "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR") or os.path.join(_TRADINGAGENTS_HOME, "logs"),
         "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR") or os.path.join(_TRADINGAGENTS_HOME, "cache"),
         "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
@@ -131,6 +163,17 @@ def build_default_config() -> dict:
         # Checkpoint/resume: when True, LangGraph saves state after each node
         # so a crashed run can resume from the last successful step.
         "checkpoint_enabled": False,
+        # Agent I/O contract validation (ADR-001, docs/architecture/adr/
+        # 001-agent-io-contracts.md). "off" keeps the baseline behaviour
+        # byte-compatible; "validate" checks every agent's input and output on
+        # all accepted routes and aborts the run on an unrecovered contract
+        # failure; "validate+repair" additionally allows one semantic repair.
+        # Any other value is a configuration error, raised by the helpers in
+        # tradingagents/agents/contracts.py rather than guessed around.
+        "agent_contract_mode": AGENT_CONTRACT_MODE_OFF,
+        # Version of the agent I/O contract; recorded in the run signature so a
+        # checkpoint written under a different contract is not resumed blindly.
+        "agent_contract_version": AGENT_CONTRACT_VERSION,
         # Output language for analyst reports and final decision
         # Internal agent debate stays in English for reasoning quality
         "output_language": "English",
@@ -209,6 +252,13 @@ def build_default_config() -> dict:
         },
 
     })
+    # Local import: ``tradingagents.config_validation`` imports this module (ADR-002 section 3).
+    from tradingagents.config_validation import ConfigValidationError, validate_config
+
+    problems = validate_config(config)
+    if problems:
+        raise ConfigValidationError(problems)
+    return config
 
 
 DEFAULT_CONFIG = build_default_config()

@@ -5,10 +5,14 @@ from tradingagents.agents.context import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.contracts import guard_trader_plan
 
 
 def create_aggressive_debator(llm):
     def aggressive_node(state) -> dict:
+        # Upstream contract guard, first: an invalid or failed trader plan never
+        # reaches this model call, and it costs no invocation (ADR-001 section 2.7).
+        trader_decision = guard_trader_plan(state)
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
         aggressive_history = risk_debate_state.get("aggressive_history", "")
@@ -20,14 +24,16 @@ def create_aggressive_debator(llm):
             risk_debate_state.get("current_neutral_response", ""), "neutral analyst"
         )
 
-        market_research_report = report_or_absent(state["market_report"], "market")
-        sentiment_report = report_or_absent(state["sentiment_report"], "sentiment")
-        news_report = report_or_absent(state["news_report"], "news")
-        fundamentals_report = report_or_absent(state["fundamentals_report"], "fundamentals")
+        # The four analyst reports are optional context (ADR-001 section 3): absent, ``None``
+        # or blank means no report, never a ``KeyError``. The guard above already refused a
+        # non-text value, so ``state.get`` cannot hide a malformed report.
+        market_research_report = report_or_absent(state.get("market_report"), "market")
+        sentiment_report = report_or_absent(state.get("sentiment_report"), "sentiment")
+        news_report = report_or_absent(state.get("news_report"), "news")
+        fundamentals_report = report_or_absent(state.get("fundamentals_report"), "fundamentals")
         instrument_context = get_instrument_context_from_state(state)
         portfolio_context = get_portfolio_context_from_state(state)
 
-        trader_decision = state["trader_investment_plan"]
 
         prompt = f"""As the Aggressive Risk Analyst, your role is to actively champion high-reward, high-risk opportunities, emphasizing bold strategies and competitive advantages. When evaluating the trader's decision or plan, focus intently on the potential upside, growth potential, and innovative benefits—even when these come with elevated risk. Use the provided market data and sentiment analysis to strengthen your arguments and challenge the opposing views. Specifically, respond directly to each point made by the conservative and neutral analysts, countering with data-driven rebuttals and persuasive reasoning. Highlight where their caution might miss critical opportunities or where their assumptions may be overly conservative. Here is the trader's decision:
 

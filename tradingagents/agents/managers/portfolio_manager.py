@@ -15,22 +15,35 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
+from tradingagents.agents.contracts import (
+    PORTFOLIO_MANAGER,
+    StrictPortfolioDecision,
+    active_mode,
+    bind_strict,
+    build_repair_prompt,
+    contract_state_update,
+    require_identity,
+    run_agent_contract,
+    validate_input,
+)
 from tradingagents.agents.rating import parse_rating
 from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
 from tradingagents.agents.structured import NO_EXTERNAL_TOOLS, bind_structured, invoke_structured
 
 
 def create_portfolio_manager(llm, memory_reader=None):
-    """Build the Portfolio Manager node.
-
-    ``memory_reader(ticker, trade_date)`` returns ``(past_context, note)`` and
-    is called once, before the prompt is assembled, when review is enabled. It
-    lets a resumed run read a revocation saved after the checkpoint. Without a
-    reader, the node uses the ``past_context`` the Memory Log step put in state.
-    """
-    structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
-
+    """Build a manager that can refresh reviewed memory before composing its prompt."""
     def portfolio_manager_node(state) -> dict:
+        mode = active_mode()
+        if mode is None:
+            structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
+        else:
+            # Input contract first: both saved plans are revalidated before any state
+            # indexing or prompt binding, so a stale plan costs zero model calls (FR-7,
+            # INV-10). The identity is read by this node itself (review item C).
+            validate_input(PORTFOLIO_MANAGER, state, mode)
+            require_identity(PORTFOLIO_MANAGER, state, mode)
+            structured_llm = bind_strict(llm, PORTFOLIO_MANAGER)
         instrument_context = get_instrument_context_from_state(state)
         portfolio_context = get_portfolio_context_from_state(state)
 
@@ -93,13 +106,33 @@ Write these sections, in this order, starting with the rating on its own line:
 
         # The typed rating is the decision; the rendered text only carries it.
         # Read back from text, a rating the thesis quotes could replace it.
-        decision = invoke_structured(structured_llm, prompt, "Portfolio Manager")
-        if decision is not None:
-            final_trade_decision = render_pm_decision(decision)
-            final_rating = decision.rating.value
+        if mode is None:
+            decision = invoke_structured(structured_llm, prompt, "Portfolio Manager")
+            if decision is not None:
+                final_trade_decision = render_pm_decision(decision)
+                final_rating = decision.rating.value
+            else:
+                final_trade_decision = llm.invoke(prompt).content
+                final_rating = parse_rating(final_trade_decision)
         else:
-            final_trade_decision = llm.invoke(prompt).content
-            final_rating = parse_rating(final_trade_decision)
+            # The typed rating is the decision; the rendered text only carries it. An
+            # unrecovered output raises before any decision reaches state (FR-8, INV-2).
+            invocation = run_agent_contract(
+                agent=PORTFOLIO_MANAGER, state=state, structured_llm=structured_llm,
+                plain_llm=llm, prompt=prompt,
+                repair_prompt=lambda issues: build_repair_prompt(
+                    prompt, issues,
+                    "the rating on its own line exactly as Buy / Overweight / Hold / "
+                    "Underweight / Sell, plus non-empty executive summary and investment thesis",
+                ),
+            )
+            final_trade_decision = invocation.rendered
+            # ``run_agent_contract`` validates the payload against the strict PM schema, so
+            # this holds; the check states the invariant instead of merely asserting it.
+            decision_payload = invocation.payload
+            if not isinstance(decision_payload, StrictPortfolioDecision):
+                raise TypeError("a Portfolio Manager payload must be a validated StrictPortfolioDecision")
+            final_rating = decision_payload.rating.value
 
         new_risk_debate_state = {
             "history": risk_debate_state["history"],
@@ -113,12 +146,14 @@ Write these sections, in this order, starting with the rating on its own line:
             "count": risk_debate_state["count"],
         }
 
-        return {
+        update = {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
             "final_rating": final_rating,
             "past_context": past_context,
             "memory_note": memory_note,
         }
-
+        if mode is not None:
+            update["contract_records"] = contract_state_update(state.get("contract_records"))
+        return update
     return portfolio_manager_node

@@ -5,10 +5,14 @@ from tradingagents.agents.context import (
     opponent_argument_or_opening,
     report_or_absent,
 )
+from tradingagents.agents.contracts import guard_trader_plan
 
 
 def create_conservative_debator(llm):
     def conservative_node(state) -> dict:
+        # Upstream contract guard, first: an invalid or failed trader plan never
+        # reaches this model call, and it costs no invocation (ADR-001 section 2.7).
+        trader_decision = guard_trader_plan(state)
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state.get("history", "")
         conservative_history = risk_debate_state.get("conservative_history", "")
@@ -20,14 +24,16 @@ def create_conservative_debator(llm):
             risk_debate_state.get("current_neutral_response", ""), "neutral analyst"
         )
 
-        market_research_report = report_or_absent(state["market_report"], "market")
-        sentiment_report = report_or_absent(state["sentiment_report"], "sentiment")
-        news_report = report_or_absent(state["news_report"], "news")
-        fundamentals_report = report_or_absent(state["fundamentals_report"], "fundamentals")
+        # The four analyst reports are optional context (ADR-001 section 3): absent, ``None``
+        # or blank means no report, never a ``KeyError``. The guard above already refused a
+        # non-text value, so ``state.get`` cannot hide a malformed report.
+        market_research_report = report_or_absent(state.get("market_report"), "market")
+        sentiment_report = report_or_absent(state.get("sentiment_report"), "sentiment")
+        news_report = report_or_absent(state.get("news_report"), "news")
+        fundamentals_report = report_or_absent(state.get("fundamentals_report"), "fundamentals")
         instrument_context = get_instrument_context_from_state(state)
         portfolio_context = get_portfolio_context_from_state(state)
 
-        trader_decision = state["trader_investment_plan"]
 
         prompt = f"""As the Conservative Risk Analyst, your primary objective is to protect assets, minimize volatility, and ensure steady, reliable growth. You prioritize stability, security, and risk mitigation, carefully assessing potential losses, economic downturns, and market volatility. When evaluating the trader's decision or plan, critically examine high-risk elements, pointing out where the decision may expose the firm to undue risk and where more cautious alternatives could secure long-term gains. Here is the trader's decision:
 

@@ -1,0 +1,748 @@
+# CS5351 requirements — Agent I/O Contract Validation and Controlled Recovery
+#
+# Intended to be validated against docs/req/req-schema.json (schema_version 1.1).
+# Baseline: TradingAgents v0.7.1, commit c4544913a14ed3df5f1ed7b9e8483270ce20682a
+#
+# Status values here describe the DOCUMENT state, not implementation state.
+# All requirements are "approved" (document) because the reviewed scope, ADR design and
+# test specification were approved before implementation.
+#
+# Every requirement below carries:
+#   - priority      MoSCoW (must / should / could / wont)
+#   - fit_criterion the explicit condition under which the requirement fits the project
+#   - metric/threshold where a measurable claim is made
+#   - tradeoff/source  what it costs and where it comes from
+#   - verified_by   the repository test nodes that actually asserted it (empty = none)
+#
+# Evidence strings are repository facts (file:line) or the literal prefix "hypothesis:".
+
+meta:
+  project: "CS5351 project on TradingAgents v0.7.1"
+  baseline_commit: "c4544913a14ed3df5f1ed7b9e8483270ce20682a"
+  document_version: "1.1"
+  scope: "Research Manager, Trader, Portfolio Manager contracts; risk debator upstream guards; graph/CLI failure handling"
+  status: approved
+  validation_method: >
+    Validated with a real JSON Schema check (jsonschema, draft-07) only when that package is
+    installed; otherwise YAML parsing alone is reported and the schema check is stated as
+    unavailable. No schema check is claimed that did not run.
+
+requirements:
+  - id: FR-1
+    type: functional
+    title: "Explicit input contract per agent"
+    statement: >
+      Each of Research Manager, Trader and Portfolio Manager has an explicit input
+      contract covering required keys, types, permitted absence of optional data, and the
+      nested fields the agent actually reads.
+    rationale: >
+      The current nodes index state directly and interpolate whatever they find.
+    priority: must
+    fit_criterion: >
+      Fits when every state field an agent reads is either explicitly required and checked,
+      or explicitly optional with a defined absent/None/blank meaning. Does not fit if a
+      valid optional field can still abort a run.
+    metric: "contract input issues produced on a state whose only optional analyst reports are absent, None or blank"
+    threshold: "0 issues and exactly 1 structured call"
+    tradeoff: >
+      A second description of each agent's inputs must be kept in step with the node; drift
+      between contract and node is now the main failure mode (BD-006).
+    source: "ADR-001 section 2.1 and section 3; approval docs/approvals/agent-contract-v1.md"
+    evidence:
+      - "tradingagents/agents/managers/research_manager.py:19"
+      - "tradingagents/agents/managers/research_manager.py:21"
+      - "tradingagents/agents/trader/trader.py:26"
+      - "tradingagents/agents/trader/trader.py:32"
+      - "tradingagents/agents/managers/portfolio_manager.py:30"
+      - "tradingagents/agents/managers/portfolio_manager.py:33"
+    verification: ["T-2", "T-3", "T-4"]
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t2_optional_analyst_reports_never_fail"
+      - "tests/test_agent_contracts.py::test_t3_invalid_input_costs_zero_calls"
+      - "tests/test_agent_contracts_integration.py::test_h_trader_accepts_optional_reports_absent_none_or_blank"
+      - "tests/test_agent_contracts_integration.py::test_h_risk_debators_accept_optional_reports_absent_none_or_blank"
+    status: approved
+
+  - id: FR-2
+    type: functional
+    title: "Output contract on every accepted route"
+    statement: >
+      Every enabled output route (structured, compatibility free-text fallback, and
+      repaired output in validate+repair) is validated against the same output contract
+      before the result may be written to state.
+    rationale: >
+      Rendered free text currently bypasses field checks entirely.
+    priority: must
+    fit_criterion: >
+      Fits when no route can write a payload with a missing or blank required field into
+      state. Does not fit if any enabled route (structured, free text, repaired) skips the
+      same required-field check.
+    metric: "accepted payloads with a blank required field across all enabled routes"
+    threshold: "0"
+    tradeoff: >
+      Extra validation work on every call; a model that writes a plausible but field-less
+      answer is now rejected instead of used.
+    source: "ADR-001 section 2.2 and section 3; test spec T-5, T-28"
+    evidence:
+      - "tradingagents/agents/structured.py:84-95"
+      - "tradingagents/agents/managers/portfolio_manager.py:85-86"
+    verification: ["T-5", "T-28"]
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t5_blank_narrative_fails"
+      - "tests/test_agent_contracts.py::test_t28_required_field_structured_route"
+      - "tests/test_agent_contracts.py::test_t28_required_field_free_text_route"
+    status: approved
+
+  - id: FR-3
+    type: functional
+    title: "Strict numeric validation before permissive coercion"
+    statement: >
+      In enhanced modes, nonfinite numbers (NaN, +Infinity, -Infinity) and ambiguous
+      numeric values (invalid percentages, ranges, booleans) are rejected before the
+      permissive baseline coercion can convert them to None. A rejected value must not
+      pass as None. A legal absence (the field omitted) and explicit numeric formatting
+      such as "189.5" or "$1,234.50" remain supported. No universal price-sign rule is
+      imposed because negative prices are possible for some supported assets.
+    priority: must
+    fit_criterion: >
+      Fits when an out-of-domain or nonfinite numeric is refused and never silently becomes
+      None, while legal formatting such as "189.5" or "$1,234.50" is preserved. Does not fit
+      if a rejected value can reach state as None.
+    metric: "raw invalid numerics (NaN, +/-Inf, percentages, ranges, booleans) accepted as None or as a value"
+    threshold: "0 accepted; each rejected with the field named"
+    tradeoff: >
+      A second, stricter parser beside the permissive baseline coercer (DB-001); the two
+      paths must not diverge.
+    source: "ADR-001 section 2.2; test spec T-6, T-7, T-26"
+    evidence:
+      - "tradingagents/agents/schemas.py:30"
+      - "tradingagents/agents/schemas.py:33-58"
+      - "tradingagents/agents/schemas.py:52"
+      - "hypothesis: negative settlement prices occur for some futures contracts; no in-repo domain catalogue confirms which assets permit them"
+    verification: ["T-6", "T-7", "T-26"]
+    status: approved
+
+  - id: FR-4
+    type: functional
+    title: "Context consistency checks only when context is available"
+    statement: >
+      Cross-field consistency checks run only when the referenced context is present in
+      state. Absent context is recorded as skipped, never as a failure. Disagreement
+      between the Trader action and the Research Manager recommendation is recorded as
+      informational and does not invalidate the contract.
+    priority: should
+    fit_criterion: >
+      Fits when a disagreement is visible to a reviewer but never aborts a run, and an
+      unavailable comparison is recorded as skipped rather than passed or failed. Does not
+      fit if a heuristic over prose (such as ticker detection) decides validity.
+    metric: "runs aborted because of a documented informational disagreement"
+    threshold: "0"
+    tradeoff: >
+      Some real disagreements pass through unflagged; the check informs, it does not protect.
+    source: "ADR-001 section 3 consistency checks; test spec T-8, T-9"
+    evidence:
+      - "tradingagents/agents/trader/trader.py:76-78"
+      - "tradingagents/agents/context.py:190-201"
+    verification: ["T-8", "T-9", "T-28"]
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t8_action_disagreement_is_informational"
+      - "tests/test_agent_contracts.py::test_t9_check_skipped_when_context_absent"
+    status: approved
+
+  - id: FR-5
+    type: functional
+    title: "At most one recovery, then complete revalidation"
+    statement: >
+      At most one recovery call is attempted per agent per run. A recovered payload is
+      revalidated in full against the same contract, not only against the field that
+      failed.
+    priority: must
+    fit_criterion: >
+      Fits when a syntactically recoverable failure costs at most one extra call and the
+      recovered answer is checked as strictly as the first. Does not fit if recovery can
+      loop, or if a repaired answer is trusted without full revalidation.
+    metric: "logical model invocations per agent per run"
+    threshold: "<= 2 (structured + at most one of free_text_recovery or semantic_repair)"
+    tradeoff: >
+      A wasted second call on a genuinely broken model; the alternative is an immediate
+      abort or an unbounded retry loop.
+    source: "ADR-001 section 2.3, 2.4; test spec T-10, T-11, T-12, T-27"
+    evidence:
+      - "tradingagents/agents/managers/portfolio_manager.py:85-86"
+    verification: ["T-10", "T-11", "T-12", "T-27"]
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t10_repair_uses_the_repaired_payload"
+      - "tests/test_agent_contracts.py::test_t11_two_failures_exhaust_the_budget"
+      - "tests/test_agent_contracts.py::test_t12_no_third_call_after_invalid_fallback"
+    status: approved
+
+  - id: FR-6
+    type: functional
+    title: "Stable error record"
+    statement: >
+      Validation outcomes are recorded in state and in the report as a stable, ordered,
+      timestamp-free record containing agent, stage, ordered issues and the call
+      accounting fields.
+    priority: must
+    fit_criterion: >
+      Fits when a reviewer can reconstruct, from a stable record, which agent failed at which
+      stage with which fields, without reading model text. Does not fit if the record varies
+      between identical runs or carries model content.
+    metric: "difference between records for the same input, and keys present"
+    threshold: "byte-identical; exactly the six documented accounting keys"
+    tradeoff: >
+      A record kept for every agent call costs some memory and must stay payload-free.
+    source: "ADR-001 section 2.12; test spec T-13, T-14, T-19"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t13_record_keys_and_retry_accounting"
+      - "tests/test_agent_contracts.py::test_t14_records_are_byte_identical"
+
+    verification: ["T-13", "T-14", "T-19"]
+    status: approved
+
+  - id: FR-7
+    type: functional
+    title: "Invalid input causes zero model calls"
+    statement: >
+      When an agent's input contract fails, the agent performs zero invocations of the
+      structured model and zero invocations of the plain model, and raises the typed
+      contract error.
+    evidence:
+      - "tradingagents/agents/managers/portfolio_manager.py:80"
+      - "tradingagents/agents/structured.py:92-95"
+    priority: must
+    fit_criterion: >
+      Fits when an unreadable state is refused before any model call, so a broken state costs
+      nothing. Does not fit if an invalid input still triggers one invocation.
+    metric: "model invocations on an input-invalid agent"
+    threshold: "0 (structured and plain both zero)"
+    tradeoff: >
+      The contract must run before the node reads state; that ordering is an invariant the
+      code must keep.
+    source: "ADR-001 section 2.6; test spec T-3, T-4"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t3_invalid_input_costs_zero_calls"
+      - "tests/test_agent_contracts_integration.py::test_c_malformed_node_input_raises_input_error_with_no_invocation"
+      - "tests/test_agent_contracts_integration.py::test_h_trader_rejects_a_required_invalid_plan_with_zero_calls"
+
+    verification: ["T-3", "T-4"]
+    status: approved
+
+  - id: FR-8
+    type: functional
+    title: "Unrecovered invalid output aborts dependent execution"
+    statement: >
+      When output validation cannot be recovered, the agent raises AgentContractError so
+      that dependent graph execution does not run. No validation text may stand in for a
+      plan or a decision.
+    evidence:
+      - "tradingagents/graph/setup.py:175"
+      - "tradingagents/graph/setup.py:185"
+    priority: must
+    fit_criterion: >
+      Fits when an unrecovered invalid output stops the run and no dependent agent runs. Does
+      not fit if a failure still produces a downstream plan, debate or decision.
+    metric: "dependent model invocations after an unrecovered failure"
+    threshold: "0 for Trader, Aggressive, Conservative, Neutral and Portfolio Manager"
+    tradeoff: >
+      The user loses the analysis rather than receiving a degraded one.
+    source: "ADR-001 section 2.6, 2.7; test spec T-15, T-16, T-17, T-18"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t15_failed_pm_publishes_nothing"
+      - "tests/test_agent_contracts_integration.py::test_t16_failed_research_manager_stops_every_dependent"
+      - "tests/test_agent_contracts_integration.py::test_t17_failed_trader_stops_the_risk_debate"
+      - "tests/test_agent_contracts_integration.py::test_t18_failure_retains_checkpoint_and_writes_audit"
+
+    verification: ["T-15", "T-16", "T-17", "T-18"]
+    status: approved
+
+  - id: FR-9
+    type: functional
+    title: "No substituted values"
+    statement: >
+      No validation path may substitute a Hold rating, any other rating, a price, zero,
+      or prose on the model's behalf.
+    evidence:
+      - "tradingagents/agents/rating.py:26-32"
+    priority: must
+    fit_criterion: >
+      Fits when a failed run leaves the decision absent and the rating absent or REVIEW. Does
+      not fit if any rating, price, zero or prose is invented on the model's behalf.
+    metric: "substituted decision values written by a failed run"
+    threshold: "0"
+    tradeoff: >
+      No best-effort answer is offered on failure; the report must explain the failure.
+    source: "ADR-001 section 2.9; test spec T-15, T-19"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t15_failed_pm_publishes_nothing"
+      - "tests/test_agent_contracts_integration.py::test_t19_failed_run_has_a_contract_block_and_no_fabricated_proposal"
+
+    verification: ["T-15", "T-19"]
+    status: approved
+
+  - id: FR-10
+    type: functional
+    title: "Honest call accounting"
+    statement: >
+      The record reports the observable logical invocations (structured,
+      free_text_recovery, semantic_repair, logical_total) and the configured SDK retry
+      budget (llm_max_retries). Observed HTTP attempt counts are reported as unknown; no
+      provider default is assumed and no measured attempt count is claimed.
+    evidence:
+      - "tradingagents/default_config.py:117-120"
+      - "tradingagents/llm_clients/factory.py:123-125"
+      - "tests/test_llm_max_retries.py:47-57"
+    priority: should
+    fit_criterion: >
+      Fits when every count in the record is an observed logical invocation and attempt counts
+      that cannot be observed are labelled unknown. Does not fit if a number is guessed or a
+      provider default is assumed.
+    metric: "record fields reported as measured rather than observed or unknown"
+    threshold: "0; observed_http_attempts is always the string 'unknown'"
+    tradeoff: >
+      Less impressive-looking accounting; no claim about real HTTP attempts or cost.
+    source: "ADR-001 section 2.12; test spec T-13, T-29"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t13_record_keys_and_retry_accounting"
+      - "tests/test_agent_contracts.py::test_t29_transport_error_not_replaced_by_fallback"
+
+    verification: ["T-13", "T-29"]
+    status: approved
+
+  - id: FR-11
+    type: functional
+    title: "Report and renderer compatibility"
+    statement: >
+      Renderers and report section paths and headings are preserved for valid payloads. A
+      failure adds a Contract Validation block and never renames a section or fabricates a
+      decision line.
+    evidence:
+      - "tradingagents/agents/schemas.py:191-213"
+      - "tradingagents/agents/schemas.py:268-288"
+      - "tradingagents/reporting.py:50-73"
+    priority: must
+    fit_criterion: >
+      Fits when valid payloads render byte-identically to baseline and a failure only adds a
+      Contract Validation block. Does not fit if a section heading changes or a decision line
+      is fabricated.
+    metric: "difference between rendered output and the baseline renderer for the same payload"
+    threshold: "byte-identical"
+    tradeoff: >
+      The failure block is additional surface that must not collide with existing headings.
+    source: "ADR-001 section 2.11; test spec T-24, T-19"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t24_rendering_matches_baseline_renderer"
+      - "tests/test_agent_contracts_integration.py::test_t19_failed_run_has_a_contract_block_and_no_fabricated_proposal"
+
+    verification: ["T-24"]
+    status: approved
+
+  - id: FR-12
+    type: functional
+    title: "Scope confinement"
+    statement: >
+      The increment adds no brokerage or trading execution, no credential handling, no new
+      network path and no new graph nodes or edges.
+    evidence:
+      - "tests/test_layering.py:26-35"
+    priority: must
+    fit_criterion: >
+      Fits when the increment adds no brokerage execution, credential handling, new network
+      path or new graph node/edge. Does not fit if any of those enter the change.
+    metric: "new graph nodes or edges, new vendor/network calls, credential handling"
+    threshold: "0"
+    tradeoff: >
+      Some tests must be built on fixtures rather than live data.
+    source: "ADR-001 section 6 approved source scope; AGENTS.md hard rules"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t23_three_modes_use_independent_fixtures"
+
+    verification: ["T-23"]
+    status: approved
+
+  - id: INV-1
+    type: invariant
+    title: "Failure text never reaches a consumer"
+    statement: >
+      No validation-failure text may appear in investment_plan, trader_investment_plan or
+      final_trade_decision, nor in any risk-debate prompt.
+    evidence:
+      - "tradingagents/agents/risk_mgmt/aggressive_debator.py:30"
+      - "tradingagents/agents/risk_mgmt/conservative_debator.py:30"
+      - "tradingagents/agents/risk_mgmt/neutral_debator.py:30"
+    priority: must
+    fit_criterion: >
+      Fits when no failure text can appear in a plan or a risk-debate prompt. Does not fit if a
+      marker or error message is consumed as content.
+    metric: "failure markers reaching a plan field or a debate prompt"
+    threshold: "0"
+    tradeoff: >
+      Failure markers are written yet must be rejected by every reader; the readers carry a
+      guard (defence in depth).
+    source: "ADR-001 section 2.7, 2.8; test spec T-15, T-16, T-17"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t17_risk_guard_rejects_a_failure_marker"
+      - "tests/test_agent_contracts.py::test_t4_failure_marker_is_not_input"
+
+    verification: ["T-15", "T-16", "T-17"]
+    status: approved
+
+  - id: INV-2
+    type: invariant
+    title: "No publishable rating from a failed run"
+    statement: >
+      A failed Portfolio Manager writes no final_trade_decision and no final_rating other
+      than absence or REVIEW.
+    evidence:
+      - "tradingagents/agents/rating.py:106-112"
+    priority: must
+    fit_criterion: >
+      Fits when a failed Portfolio Manager yields no final_trade_decision and no rating other
+      than absence or REVIEW. Does not fit if a failed run can be read as a decision.
+    metric: "final_rating values produced by a failed run other than absent or REVIEW"
+    threshold: "0"
+    tradeoff: >
+      Downstream readers see absence or REVIEW and must already handle it.
+    source: "ADR-001 section 2.9; test spec T-15, T-19"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t15_failed_pm_publishes_nothing"
+
+    verification: ["T-15", "T-19"]
+    status: approved
+
+  - id: INV-3
+    type: invariant
+    title: "Zero calls on invalid input"
+    statement: "An input-invalid agent makes zero model invocations."
+    priority: must
+    fit_criterion: >
+      Fits when an input-invalid agent makes no model call at all. Does not fit if validation
+      runs after the first invocation.
+    metric: "model invocations for an input-invalid agent"
+    threshold: "0"
+    tradeoff: >
+      Validation must precede every read of the state in the node.
+    source: "ADR-001 section 2.6; test spec T-3, T-4"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t3_invalid_input_costs_zero_calls"
+
+    verification: ["T-3", "T-4"]
+    status: approved
+
+  - id: INV-4
+    type: invariant
+    title: "Logical invocation ceiling of two"
+    statement: >
+      Per agent per run there are at most two logical model invocations: the structured
+      invocation plus at most one of free_text_recovery or semantic_repair. There is no
+      third call, counted or uncounted.
+    evidence:
+      - "tradingagents/agents/structured.py:92"
+      - "tradingagents/agents/structured.py:95"
+    priority: must
+    fit_criterion: >
+      Fits when no agent can exceed two logical invocations and repair and fallback never
+      both run. Does not fit if an uncounted third call exists.
+    metric: "logical_total per agent per run"
+    threshold: "<= 2, and never (semantic_repair == 1 and free_text_recovery == 1)"
+    tradeoff: >
+      A model that needs three attempts is simply rejected.
+    source: "ADR-001 section 2.4; test spec T-11, T-12, T-27"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t11_two_failures_exhaust_the_budget"
+      - "tests/test_agent_contracts.py::test_t12_repair_and_fallback_never_both_run"
+
+    verification: ["T-11", "T-12", "T-27"]
+    status: approved
+
+  - id: INV-5
+    type: invariant
+    title: "Deterministic record"
+    statement: "The same input yields a byte-identical error record."
+    priority: should
+    fit_criterion: >
+      Fits when the same input yields a byte-identical record. Does not fit if the record
+      carries a timestamp, duration or unstable ordering.
+    metric: "byte difference between two records for the same input"
+    threshold: "0"
+    tradeoff: >
+      No timestamps or durations in the record, so timing must be kept elsewhere.
+    source: "ADR-001 section 2.12; test spec T-14"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t14_records_are_byte_identical"
+
+    verification: ["T-14"]
+    status: approved
+
+  - id: INV-6
+    type: invariant
+    title: "Optional analyst absence is valid"
+    statement: >
+      An analyst report that is absent, None or blank is valid optional input for all
+      three agents. No requirement exists that every analyst was selected.
+    evidence:
+      - "tradingagents/agents/context.py:190-201"
+      - "tradingagents/agents/trader/trader.py:32-44"
+      - "tests/test_structured_agents.py:257-267"
+    priority: must
+    fit_criterion: >
+      Fits when absent, None or blank analyst reports never fail for Research Manager, Trader
+      or any risk debator. Does not fit if a valid optional absence causes a failure or a
+      KeyError.
+    metric: "failures or KeyErrors caused by an absent, None or blank optional analyst report"
+    threshold: "0"
+    tradeoff: >
+      Reports become optional everywhere they are read, so a genuinely missing report must be
+      clearly marked as absent in the prompt rather than treated as an empty finding.
+    source: "ADR-001 section 3 input requirements; supervisor finding BD-006"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t2_optional_analyst_reports_never_fail"
+      - "tests/test_agent_contracts_integration.py::test_h_supervisor_reproduction_trader_without_market_report"
+      - "tests/test_agent_contracts_integration.py::test_h_risk_debators_accept_optional_reports_absent_none_or_blank"
+
+    verification: ["T-2", "T-3"]
+    status: approved
+
+  - id: INV-7
+    type: invariant
+    title: "Off mode is byte-compatible"
+    statement: >
+      In mode off, outputs and shared schema behaviour are byte-identical to baseline.
+    priority: must
+    fit_criterion: >
+      Fits when off-mode output and shared schema behaviour are unchanged from baseline. Does
+      not fit if enabling nothing changes any rendered output.
+    metric: "difference between off-mode output and the baseline renderers/coercion"
+    threshold: "byte-identical; the existing suite passes unchanged"
+    tradeoff: >
+      Strictness only applies when a mode is enabled; leaving it off gives no protection.
+    source: "ADR-001 section 2.3; test spec T-1, T-24, T-26"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t26_off_mode_baseline_coercer_unchanged"
+      - "tests/test_agent_contracts_integration.py::test_h_off_mode_reads_are_unchanged_for_a_valid_fixture"
+      - "tests/test_agent_contracts_integration.py::test_t1_every_mode_reaches_the_same_decision"
+
+    verification: ["T-1", "T-24", "T-26"]
+    status: approved
+
+  - id: INV-8
+    type: invariant
+    title: "No new decision or reflection from a failed run"
+    statement: >
+      A failed run writes no memory-log decision entry, triggers no reflection for a new
+      decision and performs no success checkpoint cleanup. Independence of historical
+      settlement is acknowledged: settlement of previously recorded decisions may already
+      run concurrently and is not undone or prevented by this increment.
+    evidence:
+      - "tradingagents/graph/trading_graph.py:359-371"
+      - "tradingagents/graph/trading_graph.py:309-336"
+      - "tradingagents/memory/log.py:32-60"
+      - "tradingagents/memory/settlement.py:136-193"
+    priority: must
+    fit_criterion: >
+      Fits when a failed run writes no decision entry, requests no reflection for a new
+      decision and performs no success cleanup, while settlement of older entries is honestly
+      reported as independent. Does not fit if a failed run adds a new decision or memory
+      entry.
+    metric: "new memory-log entries, record_decision calls and clear_checkpoint_on_success calls from a failed run"
+    threshold: "0"
+    tradeoff: >
+      Historical settlement that was already running is not undone; this is stated, not fixed.
+    source: "ADR-001 section 2.8; test spec T-15, T-20, T-30"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t15_failed_pm_publishes_nothing"
+      - "tests/test_agent_contracts_integration.py::test_t20_cli_failure_records_no_decision"
+      - "tests/test_agent_contracts_integration.py::test_t30_failed_run_preserves_the_earlier_success_and_adds_no_entry"
+
+    verification: ["T-15", "T-20", "T-30"]
+    status: approved
+
+  - id: INV-9
+    type: invariant
+    title: "Failed audit retained"
+    statement: >
+      A failed run writes a failed-run audit entry that cannot be mistaken for a
+      successful decision, and retains its checkpoint when checkpointing is enabled.
+    priority: must
+    fit_criterion: >
+      Fits when a failed run leaves a distinct failed-run audit and retains its checkpoint.
+      Does not fit if a failure is silent or overwrites a prior success.
+    metric: "failed-run audit files written and checkpoint steps retained"
+    threshold: ">= 1 audit carrying a failure status; checkpoint still readable"
+    tradeoff: >
+      Extra artifacts accumulate; they are never deleted by this increment.
+    source: "ADR-001 section 2.8, section 5; test spec T-18, T-19, T-30"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t18_failure_retains_checkpoint_and_writes_audit"
+      - "tests/test_agent_contracts_integration.py::test_t19_failed_run_has_a_contract_block_and_no_fabricated_proposal"
+      - "tests/test_agent_contracts_integration.py::test_g_two_consecutive_failures_keep_both_audits"
+
+    verification: ["T-18", "T-19", "T-30"]
+    status: approved
+
+  - id: NFR-1
+    type: non-functional
+    title: "No wasted model spend on invalid input"
+    statement: "100% of negative-input fixtures produce zero model invocations."
+    priority: must
+    fit_criterion: >
+      Fits when every negative-input fixture costs no model spend. Does not fit if any such
+      fixture invokes a model.
+    metric: "share of negative-input fixtures that produce zero model invocations"
+    threshold: "100%"
+    tradeoff: >
+      Validation logic must be complete before the first call.
+    source: "ADR-001 section 5 (positive consequences); test spec T-3, T-4"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t3_invalid_input_costs_zero_calls"
+
+    verification: ["T-3", "T-4"]
+    status: approved
+
+  - id: NFR-2
+    type: non-functional
+    title: "Bounded recovery"
+    statement: "Recovery calls per agent per run <= 1."
+    priority: must
+    fit_criterion: >
+      Fits when recovery is bounded to one call per agent per run. Does not fit if a retry
+      loop is possible.
+    metric: "recovery calls per agent per run"
+    threshold: "<= 1"
+    tradeoff: >
+      A second repair is impossible even when it might succeed.
+    source: "ADR-001 section 2.4; test spec T-10, T-11, T-27"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t11_two_failures_exhaust_the_budget"
+
+    verification: ["T-10", "T-11", "T-27"]
+    status: approved
+
+  - id: NFR-3
+    type: non-functional
+    title: "Accounting completeness"
+    statement: >
+      The record contains structured, free_text_recovery, semantic_repair, logical_total,
+      sdk_retry_budget and observed_http_attempts set to unknown.
+    priority: should
+    fit_criterion: >
+      Fits when the record exposes exactly the documented accounting fields, with the retry
+      budget from configuration and HTTP attempts marked unknown. Does not fit if a field is
+      missing or a measured attempt count is invented.
+    metric: "accounting keys present and the value of observed_http_attempts"
+    threshold: "exactly six keys; observed_http_attempts == 'unknown'"
+    tradeoff: >
+      The record cannot report real HTTP cost; only logical calls are known.
+    source: "ADR-001 section 2.12; test spec T-13, T-29"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t13_record_keys_and_retry_accounting"
+      - "tests/test_agent_contracts.py::test_t13_configured_retry_budget_is_reported"
+
+    verification: ["T-13", "T-29"]
+    status: approved
+
+  - id: NFR-4
+    type: non-functional
+    title: "Off-mode regression"
+    statement: "The complete existing offline test suite passes unchanged in mode off."
+    priority: must
+    fit_criterion: >
+      Fits when the complete existing offline suite passes with zero failures in off mode. Does
+      not fit if any pre-existing test changes behaviour or fails.
+    metric: "failures and errors in the offline suite"
+    threshold: "0 failures, 0 errors"
+    tradeoff: >
+      Off mode is the default, so this regression guard must stay green for every change.
+    source: "ADR-001 section 5; test spec T-1; AGENTS.md hard rule 4"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t1_every_mode_reaches_the_same_decision"
+
+    verification: ["T-1"]
+    status: approved
+
+  - id: NFR-5
+    type: non-functional
+    title: "Fail-closed exhaustion"
+    statement: >
+      100% of exhausted-validation fixtures end with no consumable decision and an
+      audited failure state.
+    priority: must
+    fit_criterion: >
+      Fits when every exhausted-validation fixture ends with no consumable decision and an
+      audited failure. Does not fit if a failed run leaves a publishable state.
+    metric: "exhausted fixtures producing a consumable decision or a silent failure"
+    threshold: "0"
+    tradeoff: >
+      Failure must be surfaced to the user as a failure, not as an answer.
+    source: "ADR-001 section 2.6, 2.8; test spec T-18, T-19, T-25"
+    verified_by:
+      - "tests/test_agent_contracts.py::test_t25_validate_does_not_repair"
+      - "tests/test_agent_contracts_integration.py::test_t19_failed_run_has_a_contract_block_and_no_fabricated_proposal"
+
+    verification: ["T-18", "T-19", "T-25"]
+    status: approved
+
+  - id: NFR-6
+    type: non-functional
+    title: "Layering preserved"
+    statement: "Vendor libraries remain imported only by the data layer."
+    evidence:
+      - "tests/test_layering.py:26-35"
+    priority: should
+    fit_criterion: >
+      Fits when vendor libraries remain imported only by the data layer. Does not fit if a
+      provider SDK is imported into the contract or agent layer.
+    metric: "vendor imports outside the data layer"
+    threshold: "0 (tests/test_layering.py passes)"
+    tradeoff: >
+      Classification of transport errors matches by exception class name rather than importing
+      provider types.
+    source: "ADR-001 section 6; structural constraints SC-02, SC-03"
+
+    verification: ["T-23"]
+    status: approved
+
+  - id: NFR-7
+    type: non-functional
+    title: "Checkpoint integrity"
+    statement: >
+      Mode and contract version are part of the checkpoint signature, and saved upstream
+      payloads revalidated on enhanced resume cannot bypass the contract.
+    evidence:
+      - "tradingagents/graph/trading_graph.py:46-48"
+      - "tradingagents/graph/trading_graph.py:140-165"
+    priority: should
+    fit_criterion: >
+      Fits when mode and contract version are part of the checkpoint signature and an
+      enhanced-mode resume revalidates saved plans. Does not fit if an old checkpoint can
+      bypass the contract on resume.
+    metric: "stale plan payloads reaching a consumer on an enhanced-mode resume"
+    threshold: "0"
+    tradeoff: >
+      Changing the mode invalidates resume for an existing thread; that is intentional.
+    source: "ADR-001 section 2.10; test spec T-21, T-22"
+    verified_by:
+      - "tests/test_agent_contracts_integration.py::test_t21_signature_includes_mode_and_version"
+      - "tests/test_agent_contracts_integration.py::test_t22_same_mode_resume_revalidates_a_stale_saved_plan"
+
+    verification: ["T-21", "T-22"]
+    status: approved
+
+  - id: NFR-8
+    type: non-functional
+    title: "Traceability"
+    statement: >
+      Every requirement maps to at least one approved test in trace-matrix.md, and every
+      test maps back to requirements.
+    priority: should
+    fit_criterion: >
+      Fits when every requirement maps to at least one approved test and every test maps back.
+      Does not fit if a requirement has no test or a test maps to no requirement.
+    metric: "requirements without a test mapping, and tests without a requirement mapping"
+    threshold: "0 (see docs/architecture/trace-matrix.md)"
+    tradeoff: >
+      The mapping must be maintained by hand and can drift.
+    source: "ADR-001 and test spec coverage summary"
+
+    verification: ["T-1", "T-2", "T-3", "T-4", "T-5", "T-6", "T-7", "T-8", "T-9", "T-10", "T-11", "T-12", "T-13", "T-14", "T-15", "T-16", "T-17", "T-18", "T-19", "T-20", "T-21", "T-22", "T-23", "T-24", "T-25", "T-26", "T-27", "T-28", "T-29", "T-30"]
+    status: approved

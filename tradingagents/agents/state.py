@@ -71,3 +71,9 @@ class AgentState(MessagesState):
     past_context: Annotated[str, "Memory log context for the Portfolio Manager (same-ticker decisions + cross-ticker lessons), written by the Memory Log step"]
     memory_note: Annotated[str, "What the Memory Log step could not settle or read this run, for the report; empty when all went well"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+
+    # Contract validation records (ADR-001). Additive and empty in mode ``off``: one
+    # serialisable record per agent, written by the agent node that ran, so a resumed run can
+    # still show what each agent did (review item E). They are diagnostics, never decision
+    # inputs, and never contain model text.
+    contract_records: Annotated[dict, "Per-agent contract validation records for this run"]

@@ -11,6 +11,7 @@ from cli.models import AnalystType, AssetType
 from cli.prompts import filter_analysts_for_asset_type, parse_analysts
 from cli.run import run_analysis
 from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.config_validation import ConfigValidationError
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
 from tradingagents.portfolio import load_portfolio
@@ -93,6 +94,13 @@ def analyze(
     try:
         flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html}
         run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
+    except ConfigValidationError as failure:
+        # A bad configuration is a setup error, not a failed analysis: say which settings are
+        # wrong and exit non-zero before anything was written or called (ADR-002 section 3).
+        console.print("[bold red]Configuration is invalid; nothing was run.[/bold red]")
+        for problem in failure.problems:
+            console.print(f"  [red]{escape(str(problem))}[/red]")
+        raise typer.Exit(code=1) from None
     except _NO_CONSOLE_ERRORS:
         # A terminal with no console buffer cannot host the interactive prompts.
         # Emit one actionable line on stderr instead of a prompt_toolkit

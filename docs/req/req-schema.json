@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://cs5351.local/req-schema.json",
+  "title": "CS5351 requirements record",
+  "description": "Schema for docs/req/requirements.yaml. One requirement per record. Identifiers are stable and must not be renamed once approved.",
+  "type": "object",
+  "required": ["requirements"],
+  "additionalProperties": false,
+  "properties": {
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project": { "type": "string" },
+        "baseline_commit": { "type": "string" },
+        "document_version": { "type": "string" },
+        "scope": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "approved", "superseded"] },
+        "validation_method": {
+          "type": "string",
+          "description": "How this file was actually checked, stated honestly (e.g. YAML parse only vs. jsonschema against req-schema.json)."
+        }
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "title", "statement", "priority", "fit_criterion", "verification", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(FR|INV|NFR)-[0-9]+$"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["functional", "invariant", "non-functional"]
+          },
+          "title": { "type": "string", "minLength": 3 },
+          "statement": { "type": "string", "minLength": 10 },
+          "rationale": { "type": "string" },
+          "priority": {
+            "type": "string",
+            "enum": ["must", "should", "could", "wont"],
+            "description": "MoSCoW priority. Required for every requirement: a requirement without a priority cannot be scoped or deferred honestly."
+          },
+          "fit_criterion": {
+            "type": "string",
+            "minLength": 10,
+            "description": "The explicit condition in which this requirement is judged to fit the course project: what outcome is acceptable and what outcome is not."
+          },
+          "metric": {
+            "type": "string",
+            "description": "What is measured for this requirement, in observable terms (e.g. 'model invocations on invalid input')."
+          },
+          "threshold": {
+            "type": "string",
+            "description": "The boundary the metric must satisfy (e.g. '0', '<= 2', 'byte-identical'). Must be stated when a metric is stated."
+          },
+          "evidence": {
+            "type": "array",
+            "description": "Repository evidence as file:line or explicit hypothesis label.",
+            "items": { "type": "string" }
+          },
+          "verification": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Test IDs from docs/verification/agent-contract-test-spec.md, or 'manual: ' with a reason.",
+            "items": { "type": "string", "pattern": "^(T-[0-9]+|manual: .+)$" }
+          },
+          "verified_by": {
+            "type": "array",
+            "description": "Repository test node IDs that actually executed and asserted this requirement. Absent or empty means no executed test is claimed.",
+            "items": { "type": "string", "pattern": "^tests/[^:]+::[A-Za-z_][A-Za-z0-9_]*" }
+          },
+          "tradeoff": {
+            "type": "string",
+            "description": "What is given up by satisfying this requirement, or the cost it imposes."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where the requirement comes from: an approval record, the ADR section, or a supervisor review finding."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["proposed", "approved", "implemented", "verified", "deferred"]
+          },
+          "notes": { "type": "string" }
+        },
+        "dependencies": {
+          "metric": ["threshold"]
+        }
+
+      }
+    }
+  }
+}
