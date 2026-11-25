@@ -2,7 +2,10 @@
 
 An invariant is a property that must hold in every run where its mode is enabled. Each
 invariant lists the requirement it implements and the tests that must demonstrate it.
-"Proposed" means the test spec is approved but no implementation or test result exists.
+The table's "Proposed" labels are historical design-stage labels: implementation and
+tests have since been added. They do not establish current team approval or a result for
+the final submission. See `docs/verification/increment-v3-evidence.md` for historical
+scoped evidence and record current results separately.
 
 | ID | Invariant | Req | Tests | Status |
 |---|---|---|---|---|

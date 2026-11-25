@@ -4,8 +4,8 @@
 # Baseline: TradingAgents v0.7.1, commit c4544913a14ed3df5f1ed7b9e8483270ce20682a
 #
 # Status values here describe the DOCUMENT state, not implementation state.
-# All requirements are "approved" (document) because the reviewed scope, ADR design and
-# test specification were approved before implementation.
+# Original records retain their historical document status; the appended team-wide
+# candidates are proposed and have not been approved by the team or instructor.
 #
 # Every requirement below carries:
 #   - priority      MoSCoW (must / should / could / wont)
@@ -19,9 +19,9 @@
 meta:
   project: "CS5351 project on TradingAgents v0.7.1"
   baseline_commit: "c4544913a14ed3df5f1ed7b9e8483270ce20682a"
-  document_version: "1.1"
-  scope: "Research Manager, Trader, Portfolio Manager contracts; risk debator upstream guards; graph/CLI failure handling"
-  status: approved
+  document_version: "team-draft-1.0"
+  scope: "Team draft: Trace, Memory, Yahoo cache, agent contracts, preflight and reports; original contract records retained"
+  status: draft
   validation_method: >
     Validated with a real JSON Schema check (jsonschema, draft-07) only when that package is
     installed; otherwise YAML parsing alone is reported and the schema check is stated as
@@ -746,3 +746,461 @@ requirements:
 
     verification: ["T-1", "T-2", "T-3", "T-4", "T-5", "T-6", "T-7", "T-8", "T-9", "T-10", "T-11", "T-12", "T-13", "T-14", "T-15", "T-16", "T-17", "T-18", "T-19", "T-20", "T-21", "T-22", "T-23", "T-24", "T-25", "T-26", "T-27", "T-28", "T-29", "T-30"]
     status: approved
+
+  # Team-wide candidate records; priorities and status require team review.
+  - id: FR-13
+    type: functional
+    title: Each analysis execution attempt through the CLI or Python API shall receive its own Trace ID.
+    statement: Each analysis execution attempt through the CLI or Python API shall receive its own Trace ID.
+    priority: should
+    fit_criterion: Two executions produce different full UUID4 values. The ID is available in CLI output or through
+      the Python API's `last_trace_id`.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-T01; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: FR-14
+    type: functional
+    title: The system shall record the start, successful end, or failure of an execution.
+    statement: The system shall record the start, successful end, or failure of an execution.
+    priority: should
+    fit_criterion: A successful path records `run_start` and `run_end`; an exception path records `run_start` and
+      `run_fail` and propagates the exception to the caller. Success here means analysis execution and decision recording
+      are complete; it excludes a later choice to save a report.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-T02; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: FR-15
+    type: functional
+    title: For model and tool calls visible to the callbacks, the system shall record start, end, or error even
+    statement: For model and tool calls visible to the callbacks, the system shall record start, end, or error events
+      and associate events from the same call.
+    priority: should
+    fit_criterion: The start and end or error events of a call can be paired by `run_id`. An end event records duration
+      when a corresponding start event is available.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-T03; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: FR-16
+    type: functional
+    title: New trace records for different execution attempts shall be stored separately.
+    statement: New trace records for different execution attempts shall be stored separately.
+    priority: should
+    fit_criterion: The JSONL path includes the ticker, analysis date, and Trace ID. Sequential or tested concurrent
+      attempts do not write different Trace IDs into the same trace file.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-T04; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: FR-17
+    type: functional
+    title: The system shall support a configurable character budget for injected Memory context.
+    statement: The system shall support a configurable character budget for injected Memory context.
+    priority: should
+    fit_criterion: When configured, the complete returned text, including headings and separators, does not exceed
+      the limit. A zero budget returns an empty string.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M01; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-18
+    type: functional
+    title: When selecting settled historical records within the budget, the system shall consider ticker and da
+    statement: When selecting settled historical records within the budget, the system shall consider ticker and date
+      priority and support a shorter form.
+    priority: should
+    fit_criterion: Same-ticker records have priority, and records within each group are ordered by decision date from
+      newest to oldest. If a full record does not fit, the system tries a short form built from existing fields; if
+      that also does not fit, it may skip the record and continue.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M02; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-19
+    type: functional
+    title: Historical memory selection shall follow analysis-date filtering so that settled records unavailable
+    statement: Historical memory selection shall follow analysis-date filtering so that settled records unavailable
+      at the analysis time are not treated as available history.
+    priority: should
+    fit_criterion: Construct historical test data across dates and verify that selected records satisfy the existing
+      date-filtering rules.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M03; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-20
+    type: functional
+    title: When Memory review is enabled, a reviewer shall be able to inspect, approve, revoke, and view the re
+    statement: When Memory review is enabled, a reviewer shall be able to inspect, approve, revoke, and view the review
+      history of settled reflections.
+    priority: should
+    fit_criterion: The CLI displays reflections for review; approval requires confirmation; revocation creates a corresponding
+      history record; unsettled entries cannot be approved as settled reflections.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M04; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-21
+    type: functional
+    title: 'When review is enabled, the use of a historical reflection shall correspond to its ticker, decision '
+    statement: When review is enabled, the use of a historical reflection shall correspond to its ticker, decision
+      date, reflection version, and analysis time.
+    priority: should
+    fit_criterion: A reflection that is unapproved or revoked at the relevant time does not enter model input. Approval
+      of an old version does not automatically approve changed text. Live and historical analyses use the current
+      execution time and the analysis day's UTC end respectively as review cutoffs.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M05; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-22
+    type: functional
+    title: Reports shall be able to show the memory actually received by the Portfolio Manager, and review stat
+    statement: Reports shall be able to show the memory actually received by the Portfolio Manager, and review status
+      shall be rechecked when resuming from a checkpoint.
+    priority: should
+    fit_criterion: Use controlled examples to compare the report with actual input. Revoke an approval before resume
+      and verify that the reflection is not injected after resume.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-M06; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: FR-23
+    type: functional
+    title: Yahoo date-range market-data requests shall support a capacity-bounded, expiring in-process cache.
+    statement: Yahoo date-range market-data requests shall support a capacity-bounded, expiring in-process cache.
+    priority: should
+    fit_criterion: Identical requests reuse an entry within its TTL; different tickers or date windows do not share
+      entries; expired entries are fetched again. Current defaults are a capacity of 64 entries and a TTL of 900 seconds.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-C01; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: FR-24
+    type: functional
+    title: Actually overlapping requests for the same cache key within one process shall share data loading.
+    statement: Actually overlapping requests for the same cache key within one process shall share data loading.
+    priority: should
+    fit_criterion: In a controlled concurrent test, two same-key requests wait for one vendor load and receive independent
+      results. Requests with different keys need not be coalesced.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-C02; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: FR-25
+    type: functional
+    title: The system shall detect invalid or corrupted Yahoo CSV caches and attempt recovery.
+    statement: The system shall detect invalid or corrupted Yahoo CSV caches and attempt recovery.
+    priority: should
+    fit_criterion: An empty, malformed, or unusable cached file triggers a refetch; an invalid refresh does not overwrite
+      an existing valid file.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-C03; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: FR-26
+    type: functional
+    title: The date-range and OHLCV paths shall reject data with no usable finite closing price and handle data
+    statement: The date-range and OHLCV paths shall reject data with no usable finite closing price and handle data
+      that fails the applicable freshness condition.
+    priority: should
+    fit_criterion: Closing prices consisting only of `inf` or `-inf` are not accepted as valid; stale responses are
+      not stored as successful cache entries; a later request can retry.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-C04; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: FR-27
+    type: functional
+    title: The system shall provide in-process cache statistics.
+    statement: The system shall provide in-process cache statistics.
+    priority: should
+    fit_criterion: Counters cover memory hits, disk hits, coalesced waits, load attempts, and load failures. One failed
+      shared load is counted once, not once per waiting caller.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-C05; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: FR-28
+    type: functional
+    title: The system shall provide input/output contracts and controlled recovery modes for the Research Manag
+    statement: The system shall provide input/output contracts and controlled recovery modes for the Research Manager,
+      Trader, and Portfolio Manager.
+    priority: should
+    fit_criterion: Test structured and compatible free-text paths separately. In an enabled validation mode, invalid
+      required content cannot enter downstream state as a validated result.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-V01; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: FR-29
+    type: functional
+    title: For an unrecoverable contract failure, the system shall stop dependent execution and retain an ident
+    statement: For an unrecoverable contract failure, the system shall stop dependent execution and retain an identifiable
+      failure audit.
+    priority: should
+    fit_criterion: In a controlled failure scenario, the run records no successful decision and performs no successful
+      checkpoint cleanup; the failure reaches the caller. Concurrent settlement of historical decisions is outside
+      this rollback guarantee.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-V02; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: FR-30
+    type: functional
+    title: Before starting analysis, the system shall validate configuration and identify invalid parameters.
+    statement: Before starting analysis, the system shall validate configuration and identify invalid parameters.
+    priority: should
+    fit_criterion: When an invalid configuration is supplied through the CLI or graph construction, an error is reported
+      before model client calls and workflow execution.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-V03; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: FR-31
+    type: functional
+    title: In enhanced validation modes, unreadable optional numeric fields shall be sanitized according to the
+    statement: In enhanced validation modes, unreadable optional numeric fields shall be sanitized according to the
+      defined rules; required-field failures shall still stop the affected execution.
+    priority: should
+    fit_criterion: Invalid optional numbers are marked missing and produce diagnostics; valid content is preserved;
+      sanitation does not fabricate valid required content.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-V04; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: FR-32
+    type: functional
+    title: When saving reports, the system shall generate an integrity manifest and provide a checking command.
+    statement: When saving reports, the system shall generate an integrity manifest and provide a checking command.
+    priority: should
+    fit_criterion: Saving generates `report_manifest.json`. After a listed file is modified or deleted, `python -m
+      tradingagents.report_integrity REPORT_DIR` reports the discrepancy.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-FR-V05; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: NFR-9
+    type: non-functional
+    title: Observability
+    statement: Trace events from tested executions can be associated by Trace ID and distinguish start, success, and
+      error, within the actual visibility of callbacks.
+    priority: should
+    fit_criterion: Trace events from tested executions can be associated by Trace ID and distinguish start, success,
+      and error, within the actual visibility of callbacks.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-01; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: NFR-10
+    type: non-functional
+    title: Trace data minimization
+    statement: Trace events do not record prompts, tool arguments, model responses, API keys, or exception text; errors
+      record only exception class names. Verify that controlled sensitive samples do not appear in the trace.
+    priority: should
+    fit_criterion: Trace events do not record prompts, tool arguments, model responses, API keys, or exception text;
+      errors record only exception class names. Verify that controlled sensitive samples do not appear in the trace.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-02; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: NFR-11
+    type: non-functional
+    title: Trace fault tolerance
+    statement: A trace write or serialization failure produces a warning while analysis continues. This is the current
+      implementation policy; its adoption as a final requirement remains to be confirmed.
+    priority: should
+    fit_criterion: A trace write or serialization failure produces a warning while analysis continues. This is the
+      current implementation policy; its adoption as a final requirement remains to be confirmed.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #5'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-03; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/observability/; cli/run.py; tradingagents/graph/trading_graph.py. Verification entry points: tests/test_trace_observability.py.
+      No new test execution is claimed by this record.'
+  - id: NFR-12
+    type: non-functional
+    title: Bounded context
+    statement: When a character budget is configured, context length does not exceed it. This is not a token hard
+      limit.
+    priority: should
+    fit_criterion: When a character budget is configured, context length does not exceed it. This is not a token hard
+      limit.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-04; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py. No new test execution is claimed by this record.'
+  - id: NFR-13
+    type: non-functional
+    title: Request efficiency
+    statement: With the same mocked market-data sample, date range, and valid TTL, verify that 10 sequential requests
+      produce one mocked vendor load. Do not directly extrapolate this result to live networks or other vendors.
+    priority: should
+    fit_criterion: With the same mocked market-data sample, date range, and valid TTL, verify that 10 sequential requests
+      produce one mocked vendor load. Do not directly extrapolate this result to live networks or other vendors.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-05; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: NFR-14
+    type: non-functional
+    title: Concurrency correctness
+    statement: Controlled same-key concurrent and expiration scenarios do not raise a duplicate-deletion exception;
+      a shared load's result or error is propagated correctly.
+    priority: should
+    fit_criterion: Controlled same-key concurrent and expiration scenarios do not raise a duplicate-deletion exception;
+      a shared load's result or error is propagated correctly.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-06; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: NFR-15
+    type: non-functional
+    title: Cache recovery
+    statement: An invalid download must not overwrite a valid existing CSV; verify by comparing file bytes before
+      and after refresh.
+    priority: should
+    fit_criterion: An invalid download must not overwrite a valid existing CSV; verify by comparing file bytes before
+      and after refresh.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #6'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-07; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/dataflows/vendors/yahoo/. Verification entry points: tests/test_yahoo_range_cache.py; tests/test_yahoo_coalescing.py;
+      tests/test_ohlcv_cache_recovery.py; tests/test_cache_stats.py. No new test execution is claimed by this record.'
+  - id: NFR-16
+    type: non-functional
+    title: Compatibility
+    statement: With Memory review disabled and contract mode `off`, retain the compatibility behavior stated by the
+      relevant PRs. Demonstrate specific scope through regression tests rather than claiming all system behavior is
+      unchanged.
+    priority: should
+    fit_criterion: With Memory review disabled and contract mode `off`, retain the compatibility behavior stated by
+      the relevant PRs. Demonstrate specific scope through regression tests rather than claiming all system behavior
+      is unchanged.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #2, PR #7; PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-08; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/memory/; cli/memory.py; tradingagents/agents/contracts.py; tradingagents/config_validation.py;
+      tradingagents/report_integrity.py. Verification entry points: tests/test_memory_log.py; tests/test_memory_review.py;
+      tests/test_cli_memory_review.py; tests/test_graph_end_to_end.py; tests/test_agent_contracts_integration.py;
+      tests/test_config_validation.py; tests/test_numeric_sanitation.py; tests/test_report_integrity.py. No new test
+      execution is claimed by this record.'
+  - id: NFR-17
+    type: non-functional
+    title: Bounded recovery
+    statement: In enabled contract-validation modes, allow at most one recovery call per agent per run under the existing
+      rules; an exhausted invalid result must not be fabricated as success.
+    priority: should
+    fit_criterion: In enabled contract-validation modes, allow at most one recovery call per agent per run under the
+      existing rules; an exhausted invalid result must not be fabricated as success.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-09; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'
+  - id: NFR-18
+    type: non-functional
+    title: Report integrity
+    statement: Detect tested modifications or omissions of report files covered by the manifest. The manifest is not
+      a tamper-proof signature.
+    priority: should
+    fit_criterion: Detect tested modifications or omissions of report files covered by the manifest. The manifest
+      is not a tamper-proof signature.
+    verification:
+    - 'manual: review the mapped tests and record execution results for the accepted project revision'
+    source: 'PR #4'
+    status: proposed
+    notes: 'Consolidated draft ID G-NFR-10; proposed priority is a placeholder pending team agreement. Implementation:
+      tradingagents/agents/contracts.py; tradingagents/config_validation.py; tradingagents/report_integrity.py. Verification
+      entry points: tests/test_agent_contracts_integration.py; tests/test_config_validation.py; tests/test_numeric_sanitation.py;
+      tests/test_report_integrity.py. No new test execution is claimed by this record.'

@@ -1,0 +1,37 @@
+status: draft_incomplete
+reviewed_source_revision: a60f3507849108dd2de55880c5597db32539fbdf
+limitations:
+  - This is a partial evidence register, not the full session transcripts required by the course.
+  - Confirm dates, participants, tools and scope against original session records before submission.
+  - Do not infer the coding agent for a PR solely from its author or branch name.
+records:
+  - id: AI-01
+    scope: Trace ID development associated with PR 5
+    tool: OpenCode
+    basis: User supplied OpenCode implementation and test reports in the project conversation.
+    complete_transcript: pending_member_collection
+    verification: Confirm against the original OpenCode session and preserve the full annotated transcript.
+  - id: AI-02
+    scope: Agent validation work associated with PR 4
+    tool: OpenCode for at least the actions explicitly mentioned in the PR description
+    basis: PR 4 description attributes a dev-dependency and diagnostic correction to OpenCode.
+    complete_transcript: pending_member_collection
+    verification: The PR description alone does not prove the tool used for every change.
+  - id: AI-03
+    scope: PR 4 integration, PR 6 Windows test fix, review and authorized merges
+    tool: Codex
+    basis: Operations performed in the present Codex conversation.
+    complete_transcript: pending_export_and_team_review
+    verification: Preserve accurate attribution and ask the instructor if mixed-agent use requires clarification.
+  - id: AI-04
+    scope: Consolidated requirements, architecture, GitHub branch-protection configuration and submission-preparation draft
+    tool: Codex
+    basis: Prepared in the present Codex conversation from the course slides, merged PRs, code and tests.
+    complete_transcript: pending_export_and_team_review
+    verification: These are draft artifacts; they are not proof of team approval or prior OpenCode execution.
+  - id: AI-05
+    scope: Other work in PRs 2, 6 and 7
+    tool: unknown
+    basis: Available PR metadata does not establish the full coding-agent history.
+    complete_transcript: pending_member_collection
+    verification: Each responsible member supplies their actual session records and confirms attribution.

@@ -1,0 +1,13 @@
+{
+  // Course-review manifest, NOT verified as an automatically loaded OpenCode config.
+  // See the separate project-root opencode.jsonc for the installed version's configuration.
+  // The individual permission effects still require enforcement tests.
+  "status": "draft_not_enforced",
+  "rules": [
+    { "operation": "read_project", "policy": "allow_within_authorized_scope" },
+    { "operation": "edit_project", "policy": "allow_within_authorized_scope_and_review" },
+    { "operation": "read_or_disclose_credentials", "policy": "do_not_disclose" },
+    { "operation": "network_or_live_provider_calls", "policy": "when_needed_and_authorized" },
+    { "operation": "git_push_merge_or_change_settings", "policy": "per_team_authorization" }
+  ]
+}

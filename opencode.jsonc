@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Draft for the installed OpenCode 1.18.30 config format; team review required.
+  // A resolved config check does not prove every individual permission is enforced.
+  "instructions": [".opencode/rules.md", ".agent/rules.md"],
+  "permission": {
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      ".env*": "deny",
+      "**/.env*": "deny"
+    },
+    "edit": "allow",
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "python -m pytest*": "allow",
+      "python -m ruff*": "allow",
+      "python scripts/check_requirements.py*": "allow"
+    },
+    "external_directory": "ask"
+  }
+}

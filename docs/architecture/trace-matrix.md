@@ -81,6 +81,9 @@ Requirements live in `docs/req/requirements.yaml`.
 
 ## Status
 
-All mappings are approved as design. **No test has been implemented and no result exists.**
-When implementation begins, each row gains a result column in
-`docs/verification/agent-contract-test-spec.md`; this matrix keeps the mapping stable.
+This contract-specific matrix was originally written before implementation; its former
+statement that no tests existed is now outdated. Tests have since been added. The mapping
+alone does not establish the result of any specific test run or the team's final approval.
+See `docs/verification/increment-v3-evidence.md` for historical scoped evidence and
+`docs/architecture/team-traceability.md` for the wider team draft. Record results for
+the exact submission revision separately.

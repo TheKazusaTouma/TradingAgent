@@ -1,6 +1,6 @@
 # ADR 002 — Startup Preflight, Optional-Numeric Sanitation, Report Integrity Manifest
 
-PR packaging note: approval records and full OpenCode transcripts refer to local development and are retained separately. They are excluded from this PR. Team review and merge approval are still pending. See docs/verification/increment-v3-evidence.md for integration verification.
+Historical PR packaging note: approval records and full OpenCode transcripts referred to local development and were retained separately. PR #4 has since been merged, but that fact does not establish team approval of every requirement or make the transcripts available in this draft. See `docs/verification/increment-v3-evidence.md` for the earlier integration verification.
 
 - Status: **Accepted for implementation** — authorised directly by the student in the
   OpenCode session that produced this file. See §1 and

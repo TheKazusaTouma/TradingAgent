@@ -1,0 +1,7 @@
+version: "1.0-draft"
+status: proposed
+purpose: "Document a candidate coding-agent startup prompt for team review."
+scope: "Coding-agent instruction, not a TradingAgents runtime model prompt."
+source_file: "Prompt.md"
+runtime_integration: "not implemented or verified"
+historical_use: "not claimed"
