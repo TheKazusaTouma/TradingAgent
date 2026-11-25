@@ -1,0 +1,43 @@
+# AI-use log
+#
+# Machine-checked by tools/ai_use_log.py in CI (job: ai-use-log). A pull request
+# that changes application code, prompts, or model configuration must also change
+# this file. See docs/course-ci-gates.md for the exact scope and limitations.
+#
+# This file records AI *use* for disclosure. An entry states what was produced and
+# on what basis; it is not a human approval, a certification of correctness, and
+# not proof that a transcript exists. Attribution is only what the author can
+# actually support. Do not infer the tool from a PR's author or branch name.
+#
+# Bootstrap note: this log is introduced by the course-ci-gates change itself. The
+# first entry (AI-GOV-01) describes that change. Historic PRs before this file are
+# not retroactively disclosed here; they must be collected from original session
+# records by the responsible members.
+status: active
+reviewed_source_revision: a60f3507849108dd2de55880c5597db32539fbdf
+
+records:
+  - id: AI-GOV-01
+    scope: >-
+      CI governance work in the chore/course-ci-gates branch: requirements schema
+      validation (tools/check_requirements.py), AI-use log check
+      (tools/ai_use_log.py), scoped type check, dependency check, security
+      checks, fixed offline evaluation replay, and the new CI jobs in
+      .github/workflows/ci.yml, plus their tests and documentation. Also the dev
+      optional-dependencies change in pyproject.toml adding PyYAML>=6 (imported
+      directly by the new governance unit tests); mypy is intentionally not in
+      the dev extra.
+    tool: OpenCode (launched and directed by Codex)
+    basis: >-
+      Provenance as actually observed: the human user instructed Codex; Codex
+      launched and directed this OpenCode session and independently reviewed its
+      output and further review findings. The implementation was produced by the
+      OpenCode assistant model under that direction, not written by the student
+      personally. This entry does not claim that the student authored the OpenCode
+      prompts, nor that any human has approved the result. The raw OpenCode
+      session is preserved locally; full human review is still pending and is not
+      asserted here.
+    verification: >-
+      Local checks were run and their commands and results are recorded in
+      docs/course-ci-gates.md. Remote CI results on GitHub are not claimed by this
+      entry and must be read from the actual workflow run.
